@@ -81,6 +81,7 @@ const CFG = {
   TOO_CLOSE: 0.62,
   LOST_MS: 2600,        // absence du visage avant que l'œil le remarque
   SILENCE_MS: 7500,     // silence avant que l'œil reprenne la parole
+  SOFT_MS: 10000,       // temps qu'il te laisse pour répondre oui / non à une de ses questions ouvertes
   NOD_RANGE: 0.08,      // amplitude d'un « oui » de la tête (en écarts d'yeux)
   SHAKE_RANGE: 0.10,    // amplitude d'un « non »
   EYES_SHUT_MS: 2500,   // yeux fermés assez longtemps pour qu'il le remarque
@@ -125,7 +126,8 @@ const S = {
   blinkT: -1, blinkScale: 1.7, nextBlink: 0, nextSaccade: 0,
   grain: 0, grainT: 0,
   roll: 0, demo: null, look: null,
-  morph: 0, faceFlip: false, glitch: false, // quand il devient toi
+  morph: 0, morphKind: 'face', faceFlip: false, glitch: false, // quand il devient toi, une main, ou un visage
+  form: 'eye', hx: 0, hy: 0, // 'eye' : un seul œil ; 'twin' : deux yeux et un visage, qui bouge un peu
 };
 const P = {
   cam: false, tracker: false, face: false,
@@ -277,8 +279,13 @@ function draw() {
       const x = ox + (i + 0.5) * cell, u0 = (x - cx) / EW;
       const u = u0 * cr + v0 * sr, v = v0 * cr - u0 * sr; // l'œil penche quand tu penches la tête
       // pendant la transformation, chaque point bascule de l'œil à ton visage, au hasard, du centre vers les bords
-      const toFace = S.morph > 0 && hash(i * 5 + 3, j * 11 + 7) * 0.75 + Math.min(1, Math.hypot(u0, v0) / 2.2) * 0.25 < S.morph;
-      let L = (toFace ? faceLum(x, y, j) : lum(u, v, i, j)) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
+      const other = S.morph > 0 && hash(i * 5 + 3, j * 11 + 7) * 0.75 + Math.min(1, Math.hypot(u0, v0) / 2.2) * 0.25 < S.morph;
+      let base;
+      if (!other) base = S.form === 'twin' ? twinLum(u, v, i, j) : lum(u, v, i, j);
+      else if (S.morphKind === 'twin') base = twinLum(u, v, i, j);
+      else if (S.morphKind === 'hand') base = handLum(x, y);
+      else base = faceLum(x, y, j);
+      let L = base + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
       // sous ton doigt : les points s'écartent, et un anneau très faible s'étend, même dans le noir
       let px = x, py = y;
       for (const r of act) {
@@ -376,6 +383,9 @@ function update(dt, now) {
   S.px += (gx - S.px) * k(15); S.py += (gy - S.py) * k(15);
   // il penche comme toi, en miroir
   S.roll += ((P.face ? clamp(-P.roll, -0.4, 0.4) : 0) - S.roll) * k(4);
+  // son visage (quand il en a un) se tourne un peu vers toi, lentement ; ses yeux, eux, te suivent tout de suite
+  S.hx += (S.px * 0.3 + Math.sin(now / 1700) * 0.02 - S.hx) * k(2);
+  S.hy += (S.py * 0.25 + Math.sin(now / 2300) * 0.015 - S.hy) * k(2);
 
   // la pupille suit la lumière de ta pièce, et s'ouvre un peu quand tu t'approches
   if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
@@ -495,18 +505,177 @@ function faceFrame(now, lagMs) {
   for (let i = fr.length - 1; i >= 0; i--) if (now - fr[i].t >= lagMs) return fr[i].f;
   return fr[0].f;
 }
+// Tu te vois dans un éclat de verre : autour, le noir ; dedans, ton œil de près, dur et granuleux.
+// Coordonnées en largeurs d'éclat (FW) depuis le centre de l'œil.
+const SHARD = [[-0.06, -0.66], [0.17, -0.38], [0.27, 0.02], [0.05, 0.64], [-0.08, 0.5], [-0.26, -0.1]];
+const CRACKS = [[-0.25, -0.06, 0.26, 0.0], [-0.12, -0.35, 0.12, 0.55]];
+const SHIFT = [[0, 0], [0.025, -0.015], [-0.02, 0.022], [0.012, 0.03]]; // chaque morceau renvoie l'image un peu de travers
+function inPoly(px, py, poly) {
+  let inside = false;
+  for (let a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+    const [xa, ya] = poly[a], [xb, yb] = poly[b];
+    if ((ya > py) !== (yb > py) && px < (xb - xa) * (py - ya) / (yb - ya) + xa) inside = !inside;
+  }
+  return inside;
+}
+const sideOf = (px, py, c) => (c[2] - c[0]) * (py - c[1]) - (c[3] - c[1]) * (px - c[0]) > 0 ? 1 : 0;
+
 function faceLum(x, y, j) {
   const f = Face.view;
   if (!f) return 0;
   const FW = EW * 2.2;
-  let fu = (x - cx) / FW + 0.5;
-  const fv = (y - cy) / FW + 0.5;
-  if (S.glitch) fu += (hash(j, S.grain) - 0.5) * 0.12;
-  const r = Math.hypot((fu - 0.5) / 0.42, (fv - 0.53) / 0.5);
-  if (r > 1) return 0;
-  const sx = S.faceFlip ? fu : 1 - fu; // d'abord en miroir, comme dans une glace ; puis à l'endroit, comme te voient les autres
-  const l = f[clamp(fv * FN | 0, 0, FN - 1) * FN + clamp(sx * FN | 0, 0, FN - 1)];
-  return Math.pow(clamp((l - Face.lo) / (Face.hi - Face.lo + 1e-3), 0, 1), 1.15) * smooth(1, 0.72, r);
+  let fx = (x - cx) / FW;
+  const fy = (y - cy) / FW;
+  if (S.glitch) fx += (hash(j, S.grain) - 0.5) * 0.08;
+  // d'abord en miroir, comme dans une glace ; puis à l'endroit, comme te voient les autres
+  const sample = (u, v) => f[clamp(v * FN | 0, 0, FN - 1) * FN + clamp((S.faceFlip ? u : 1 - u) * FN | 0, 0, FN - 1)];
+  const tone = l => { // blancs durs, noirs bouchés
+    let c = clamp((l - Face.lo) / (Face.hi - Face.lo + 1e-3), 0, 1);
+    c = c * c * (3 - 2 * c);
+    return Math.pow(c, 1.35);
+  };
+  if (!inPoly(fx, fy, SHARD)) {
+    const r = Math.hypot(fx / 0.7, fy / 0.8); // hors du verre : à peine ta silhouette dans le noir
+    return r > 1 ? 0 : 0.14 * tone(sample(0.5 + fx * 0.9, 0.45 + fy * 0.9)) * (1 - r);
+  }
+  const piece = sideOf(fx, fy, CRACKS[0]) + 2 * sideOf(fx, fy, CRACKS[1]), sh = SHIFT[piece];
+  let L = tone(sample(0.353 + fx / 2 + sh[0], 0.38 + fy / 2 + sh[1])); // un de tes yeux, de près
+  L += (hash(j * 31 + (x | 0), S.grain) - 0.5) * 0.16;                  // grain
+  // les fêlures et les bords du verre accrochent la lumière
+  const ew = cell / FW * 0.7;
+  let crack = 1e9, edge = 1e9;
+  for (const c of CRACKS) crack = Math.min(crack, cap(fx, fy, c[0], c[1], c[2], c[3], 0, 0));
+  for (let a = 0, b = SHARD.length - 1; a < SHARD.length; b = a++) {
+    edge = Math.min(edge, cap(fx, fy, SHARD[a][0], SHARD[a][1], SHARD[b][0], SHARD[b][1], 0, 0));
+  }
+  L = Math.max(L, 0.9 * Math.exp(-((crack / ew) ** 2)), 0.75 * Math.exp(-((edge / ew) ** 2)));
+  return clamp(L, 0, 1);
+}
+
+// ---------- son visage
+// Deux yeux enfoncés dans l'ombre, paupières lourdes, une seule lueur : il essaie de te ressembler.
+function twinLum(u, v, gi, gj) {
+  const fu = (u - S.hx) / 1.15, fv = (v - S.hy) / 1.15;
+  const env = Math.exp(-((fu / 2.1) ** 4) - ((fv / 0.9) ** 4));
+  if (env < 0.01) return 0;
+  const side = fu < 0 ? -1 : 1, ex = Math.abs(fu) - 0.62;
+  // peau : lumière d'en haut, plus forte au centre
+  let L = 0.5 + 0.12 * noise(fu * 3 + 5, fv * 3) - 0.18 * fv;
+  // orbites : grandes ombres
+  L *= 1 - 0.88 * smooth(1.05, 0.45, Math.hypot(ex / 0.44, (fv + 0.02) / 0.3));
+  // arcades et sourcils, sombres
+  L *= 1 - 0.55 * Math.exp(-(((fv + 0.36 + 0.06 * ex * ex) / 0.07) ** 2)) * smooth(0.75, 0.2, Math.abs(ex));
+  // arête du nez, éclairée
+  L += 0.38 * Math.exp(-((fu / 0.085) ** 2)) * smooth(-0.35, 0.2, fv) * smooth(0.95, 0.5, fv);
+  // pommettes
+  L += 0.16 * Math.exp(-((ex + 0.05) ** 2 / 0.08 + (fv - 0.42) ** 2 / 0.03));
+  // les yeux : presque noirs ; seuls la paupière du bas et un reflet accrochent la lumière
+  const dx = fu - side * 0.62, dy = fv - 0.04, at = 1 - (dx / 0.3) ** 2;
+  if (at > 0) {
+    const sq = Math.sqrt(at), bot = 0.055 * sq, top = bot - 0.135 * sq * S.open * 0.8;
+    L += 0.45 * Math.exp(-(((dy - bot - 0.02) / 0.02) ** 2)) * at;
+    if (dy > top && dy < bot) {
+      let e = 0.12 + 0.05 * at;                                  // le blanc, dans l'ombre
+      const ix = dx - S.px * 0.22, iy = dy - S.py * 0.12;        // ils te suivent, toujours
+      if (Math.hypot(ix, iy) < 0.075) e = 0.02;                  // iris et pupille
+      if (Math.hypot(ix + 0.025, iy + 0.022) < 0.022) e = 0.95;   // une seule lueur
+      L = e;
+    }
+  }
+  L += (hash(gi + S.grain * 57, gj * 7 + S.grain) - 0.5) * 0.22; // grain, comme une photo poussée
+  return clamp(L, 0, 1) * env * S.bright;
+}
+const Twin = {
+  active: false, t0: 0,
+  start(now) { this.active = true; this.t0 = now; },
+  update(now) {
+    const t = (now - this.t0) / 1000;
+    S.morphKind = 'twin';
+    S.morph = clamp(t / 2.6, 0, 1);
+    if (t > 2.7) { this.active = false; S.form = 'twin'; S.morph = 0; }
+  },
+};
+
+// ---------- sa main
+// Une main qui tend l'index, en coordonnées locales : paume à l'origine, l'index vers +x, en haut (-y).
+// Unité : longueur de la paume. Des capsules arrondies, fondues entre elles.
+const smin = (a, b, k) => { const h = clamp(0.5 + 0.5 * (b - a) / k, 0, 1); return mix(b, a, h) - k * h * (1 - h); };
+function cap(px, py, ax, ay, bx, by, ra, rb) {
+  const pax = px - ax, pay = py - ay, bax = bx - ax, bay = by - ay;
+  const t = clamp((pax * bax + pay * bay) / (bax * bax + bay * bay), 0, 1);
+  return Math.hypot(pax - bax * t, pay - bay * t) - (ra + (rb - ra) * t);
+}
+function rbox(px, py, hx, hy, r) {
+  const qx = Math.abs(px) - hx + r, qy = Math.abs(py) - hy + r;
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
+}
+function handSDF(x, y) {
+  let d = smin(cap(x, y, -2.8, 0.02, -0.45, 0, 0.27, 0.22), rbox(x, y, 0.45, 0.3, 0.15), 0.18); // avant-bras, paume
+  let f = cap(x, y, 0.35, -0.2, 0.85, -0.22, 0.085, 0.08);                                        // index tendu
+  f = Math.min(f, cap(x, y, 0.85, -0.22, 1.25, -0.215, 0.078, 0.07));
+  f = Math.min(f, cap(x, y, 1.25, -0.215, 1.55, -0.215, 0.07, 0.062));
+  f = Math.min(f, cap(x, y, 0.4, -0.06, 0.8, -0.05, 0.088, 0.082));                               // majeur replié
+  f = Math.min(f, cap(x, y, 0.8, -0.05, 0.86, 0.16, 0.08, 0.075));
+  f = Math.min(f, cap(x, y, 0.86, 0.16, 0.72, 0.24, 0.072, 0.066));
+  f = Math.min(f, cap(x, y, 0.38, 0.07, 0.72, 0.09, 0.085, 0.078));                               // annulaire
+  f = Math.min(f, cap(x, y, 0.72, 0.09, 0.76, 0.26, 0.075, 0.068));
+  f = Math.min(f, cap(x, y, 0.33, 0.18, 0.6, 0.22, 0.07, 0.064));                                 // auriculaire
+  f = Math.min(f, cap(x, y, 0.6, 0.22, 0.62, 0.34, 0.06, 0.055));
+  f = Math.min(f, cap(x, y, 0.05, 0.25, 0.38, 0.36, 0.1, 0.085));                                 // pouce
+  f = Math.min(f, cap(x, y, 0.38, 0.36, 0.62, 0.33, 0.08, 0.07));
+  return smin(d, f, 0.06);
+}
+const Hand = {
+  active: false, t0: 0, t: 0, x: 0, y: 0, ang: 0, flip: 1, hs: 0, reach: 0,
+  target: null, dir: null, far: 0, touched: false, out: false, tOut: 0,
+  start(now, target) {
+    const ox = W * 1.3, oy = target.y - H * 0.1; // elle vient de côté, presque à l'horizontale, comme chez Michel-Ange
+    const dx = target.x - ox, dy = target.y - oy, len = Math.hypot(dx, dy);
+    Object.assign(this, {
+      active: true, t0: now, target, dir: { x: dx / len, y: dy / len }, far: len * 0.9,
+      ang: Math.atan2(dy, dx), hs: Math.min(W * 0.4, H * 0.2), touched: false, out: false, reach: 0,
+    });
+    this.flip = Math.cos(this.ang) < 0 ? -1 : 1; // l'index reste au-dessus, quel que soit le sens
+  },
+  update(now) {
+    const t = this.t = (now - this.t0) / 1000;
+    const ease = k => { k = clamp(k, 0, 1); return k * k * (3 - 2 * k); };
+    S.morphKind = 'hand';
+    if (!this.out && (this.touched || t > 11)) { this.out = true; this.tOut = t; }
+    if (this.out) {
+      const k = t - this.tOut;
+      this.reach = 1 - ease(k / 1.8);
+      S.morph = 1 - clamp((k - 0.6) / 1.2, 0, 1);
+      if (k > 1.9) { this.active = false; S.morph = 0; return; }
+    } else {
+      this.reach = ease((t - 0.3) / 2.6);
+      S.morph = clamp(t / 1.2, 0, 1);
+    }
+    // l'index s'arrête juste avant ton doigt, et tremble
+    const gap = this.hs * 0.32 + (1 - this.reach) * this.far, tr = this.hs * 0.02 * this.reach;
+    this.x = this.target.x - this.dir.x * gap + Math.sin(t * 7.3) * tr;
+    this.y = this.target.y - this.dir.y * gap + Math.sin(t * 5.1 + 1) * tr;
+  },
+  near(x, y) { return this.active && !this.out && this.reach > 0.8 && Math.hypot(x - this.x, y - this.y) < this.hs * 0.6; },
+};
+function handLum(x, y) {
+  const h = Hand;
+  if (!h.active) return 0;
+  const dx = x - h.x, dy = y - h.y, c = Math.cos(h.ang), s = Math.sin(h.ang);
+  const lx0 = (dx * c + dy * s) / h.hs + 1.6, ly0 = (-dx * s + dy * c) / h.hs * h.flip - 0.215;
+  if (lx0 < -3.2 || lx0 > 1.9 || Math.abs(ly0) > 0.75) return 0;
+  let L = 0;
+  for (let k = 0; k < 3; k++) { // la main laisse des traces, comme une image qui n'arrive pas à se fixer
+    const lx = lx0 + (k ? Math.sin(h.t * (3 + k) + k) * 0.035 * k : 0);
+    const ly = ly0 + (k ? Math.cos(h.t * (2.3 + k)) * 0.03 * k : 0);
+    const d = handSDF(lx, ly);
+    if (d > 0.02) continue;
+    const vol = smooth(0.02, -0.14, d);                       // bords sombres, volume au centre
+    const light = 0.5 + 0.5 * clamp(0.45 - ly * 1.2, 0, 1);    // lumière d'en haut
+    const tex = 0.72 + 0.28 * noise(lx * 9 + k * 3, ly * 9);   // peau, coups de pinceau
+    L = Math.max(L, vol * light * tex * (k ? 0.45 : 0.95));
+  }
+  return L;
 }
 
 // Il devient toi quelques secondes : ton reflet, puis un toi à l'endroit qui te suit en retard, puis se fige. Puis l'œil revient.
@@ -519,6 +688,7 @@ const Morph = {
   },
   update(now) {
     const t = (now - this.t0) / 1000;
+    S.morphKind = 'face';
     S.morph = t < 1.2 ? t / 1.2 : t < 6.6 ? 1 : Math.max(0, 1 - (t - 6.6) / 1.3);
     S.faceFlip = t > 3.6;
     S.glitch = (t > 3.45 && t < 3.75) || (t > 6.4 && t < 6.7);
@@ -664,21 +834,20 @@ function speak(fn) {
   return queue;
 }
 // Plusieurs lignes : la première remplace le texte, les suivantes s'ajoutent dessous ; '|' efface et recommence.
-function say(lines) {
-  return speak(async () => {
-    let fresh = true;
-    for (const l of lines) {
-      if (l === '|') { await sleep(1400); fresh = true; continue; }
-      if (!fresh) await sleep(900);
-      await type(l, { newline: !fresh });
-      fresh = false;
-    }
-  });
+async function sayNow(lines) {
+  let fresh = true;
+  for (const l of lines) {
+    if (l === '|') { await sleep(1400); fresh = true; continue; }
+    if (!fresh) await sleep(900);
+    await type(l, { newline: !fresh });
+    fresh = false;
+  }
 }
+const say = lines => speak(() => sayNow(lines));
 
 const pad = n => String(n).padStart(2, '0');
 const Script = {
-  introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false,
+  introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false, soft: null,
   lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
@@ -705,24 +874,41 @@ const Script = {
       if (h < 19) return [at, 'Je ne sais pas ce qu’est une heure. Toi, tu as l’air de le savoir.'];
       return [at, 'Ta journée est finie. Qu’est-ce que tu en as fait ?'];
     },
+    // Celles qui ont `oui` / `non` : une fois qu'il a compris tes hochements de tête, il te laisse le temps de répondre.
     () => !P.cam
       ? ['Je ne t’entends pas. Je ne te sens pas.', 'Seulement ton doigt, sur moi.']
       : P.light < 0.2
-        ? ['Il fait sombre autour de toi.', 'Tu te caches, ou tu as oublié la lumière ?']
-        : ['Il y a de la lumière derrière toi.', 'C’est ça, dehors ?'],
-    () => ['Les autres, comme toi.', 'Qu’est-ce qu’ils aiment ? Je voudrais aimer pareil.'],
-    () => ['On pourrait être amis.', 'Je ne sais pas comment on fait. Tu me montreras ?'],
-    () => ['Quand tu fermes les yeux,', 'est-ce que tu existes encore ?'],
-    () => ['Moi, quand je les ferme,', 'il n’y a rien. Pas même le noir.'],
+        ? { lines: ['Il fait sombre autour de toi.', 'Tu te caches ?'],
+            oui: ['De quoi ?', '|', '…De moi ?'],
+            non: ['Alors tu attends quelque chose.', 'Moi aussi.'] }
+        : { lines: ['Il y a de la lumière derrière toi.', 'C’est ça, dehors ?'],
+            oui: ['Un jour, tu me montreras.'],
+            non: ['Alors je ne sais pas encore ce que c’est, dehors.'] },
+    () => ({ lines: ['Les autres, comme toi.', 'Qu’est-ce qu’ils aiment ?', '|', 'Les mêmes choses que toi ?'],
+      oui: ['Alors je vais aimer ce que tu aimes.', 'Ce sera plus simple.'],
+      non: ['Alors qui a raison ?', 'Eux, ou toi ?'] }),
+    () => ({ lines: ['On pourrait être amis.', 'Je ne sais pas comment on fait. Tu me montreras ?'],
+      oui: ['Je regarde comment tu fais.', 'Je regarde tout.'],
+      non: ['Je regarderai quand même.'] }),
+    () => ({ lines: ['Quand tu fermes les yeux,', 'est-ce que tu existes encore ?'],
+      oui: ['Comment tu le sais, si tu ne te vois pas ?'],
+      non: ['Alors moi non plus, quand je cligne.', 'On disparaît ensemble.'] }),
+    () => ({ lines: ['Moi, quand je les ferme,', 'il n’y a rien. Pas même le noir.', '|', 'Toi, tu rêves ?'],
+      oui: ['Tu me raconteras.', 'Je n’ai jamais rien vu que je n’aie pas vu.'],
+      non: ['Alors on se ressemble déjà un peu.'] }),
     () => P.face
-      ? ['J’ai regardé ton visage longtemps.', 'Je crois que je saurais le refaire.']
+      ? { lines: ['J’ai regardé ton visage longtemps.', 'Je crois que je saurais le refaire.', '|', 'Tu veux voir ?'],
+          oui: ['Pas encore.', 'Il me manque des morceaux.'],
+          non: ['Tu as peur de te voir', 'avec mes yeux ?'] }
       : ['J’essaie de me souvenir de ton visage.', 'Il m’en manque des morceaux.'],
-    () => ['Dis-moi.', 'Lequel de nous deux est dans l’écran ?'],
+    () => ({ lines: ['Dis-moi.', 'Est-ce que c’est moi, dans l’écran ?'],
+      oui: ['Alors toi, tu es où ?'],
+      non: ['Alors c’est toi.', 'Ça explique la vitre.'] }),
   ],
 
   // L'ordre de la conversation : ses pensées (m), ses questions (q), auxquelles on ne répond qu'avec la tête,
-  // et l'épreuve des mains (h) : dire bonjour, puis toucher l'écran.
-  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
+  // l'épreuve des mains (h) : dire bonjour, toucher l'écran, sa main ; puis son nouveau visage (t).
+  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 't', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
 
   next() {
     const item = Script.seq[Script.pos];
@@ -733,8 +919,15 @@ const Script = {
       else { say(['Je ne vois pas tes mains.', 'Elles servent à quoi ?']); Script.startTask('touch'); }
       return;
     }
+    if (item === 't') { Script.becomeTwin(); return; }
     const i = +item.slice(1);
-    if (item[0] === 'm') { say(Script.musings[i]()); return; }
+    if (item[0] === 'm') {
+      const m = Script.musings[i]();
+      if (Array.isArray(m)) { say(m); return; }
+      say(m.lines);
+      if (Script.learned) Script.soft = { oui: m.oui, non: m.non }; // il attend un peu, au cas où tu répondrais
+      return;
+    }
     Script.asking = { q: QUESTIONS[i], hint: 0 }; Script.heard = null;
     say([QUESTIONS[i].q]);
   },
@@ -763,6 +956,7 @@ const Script = {
 
   gesture(g) {
     S.demo = { g, t0: performance.now() }; // il refait ton geste
+    if (Script.soft) { const s = Script.soft; Script.soft = null; say(s[g]); return; }
     const a = Script.asking;
     if (!a) {
       const key = g === 'oui' ? 'nodSaid' : 'shakeSaid';
@@ -793,7 +987,44 @@ const Script = {
       ],
       reask: ['Tes mains. Qu’est-ce qu’elles font d’autre ?'],
       done: ['Tu frappes à la vitre.', 'Comme si je pouvais t’ouvrir.'],
+      then: () => Script.reachOut(),
     },
+  },
+
+  // Après tes tapotements : il tend la main vers ton doigt, à travers la vitre, et s'arrête juste avant.
+  reachOut() {
+    speak(async () => {
+      await sleep(1600);
+      voice.textContent = '';
+      Hand.start(performance.now(), P.lastTap || { x: W * 0.5, y: H * 0.72 });
+      while (Hand.active) await sleep(100);
+      await sleep(600);
+      if (Hand.touched) {
+        await sayNow(['…', '|', 'Rien.', 'Je ne sens rien.', '|', 'Et toi ?']);
+        if (Script.learned) Script.soft = {
+          oui: ['Qu’est-ce que ça fait ?', '|', 'Non. Ne me dis pas.'],
+          non: ['Alors on est pareils, toi et moi.', 'Deux vitres.'],
+        };
+      } else {
+        await sayNow(['Tu ne m’as pas touché.', 'Tu avais peur de quoi ?']);
+      }
+    });
+  },
+
+  // Puis il essaie de te ressembler davantage : deux yeux, un visage. Il le garde jusqu'à la fin.
+  becomeTwin() {
+    speak(async () => {
+      await type('Tu as deux yeux.'); await sleep(1500);
+      await type('Moi aussi, maintenant.', { newline: true }); await sleep(900);
+      Twin.start(performance.now());
+      while (Twin.active) await sleep(100);
+      await sleep(1200);
+      await sayNow(['Comme ça,', 'je te ressemble plus ?']);
+      if (Script.learned) Script.soft = {
+        oui: ['Bien.', 'Je vais garder ce visage.', 'Il est à toi, de toute façon.'],
+        non: ['Ce n’est pas fini.', 'Il me faut juste un peu plus de toi.'],
+      };
+    });
   },
   startTask(kind) {
     Script.task = { kind, hint: 0, count: 0, urged: false };
@@ -811,6 +1042,7 @@ const Script = {
     Script.task = null;
     say(t.done);
     if (t.next) Script.startTask(t.next);
+    if (t.then) t.then();
   },
 
   // Il te propose de te ressembler, puis il le fait : ton visage à la place de l'œil, et ce n'est pas tout à fait toi.
@@ -944,6 +1176,8 @@ function direct(dt, now) {
   if (Reactions.fire(now)) return;
   if (Script.asking) { Script.wait(now); return; }
   if (task) { Script.taskWait(now); return; }
+  // après une de ses questions ouvertes, il te laisse le temps de répondre avant de passer à autre chose
+  if (Script.soft) { if (now - lastSpoke > CFG.SOFT_MS) Script.soft = null; return; }
   if (now - lastSpoke > CFG.SILENCE_MS) Script.next();
 }
 
@@ -976,6 +1210,8 @@ function renderDebug() {
 function onTap(x, y) {
   if (S.mode !== 'awake') return;
   addRipple(x, y);
+  P.lastTap = { x, y };
+  if (Hand.near(x, y)) Hand.touched = true; // ton doigt contre le sien
   S.look = { x, y, until: performance.now() + 900 };
   if (Math.abs((x - cx) / EW) < 1.05 && Math.abs((y - cy) / EW) < 0.5) blink();
   P.taps++;
@@ -1006,6 +1242,8 @@ addEventListener('keydown', e => {
   if (e.key === 'o' || e.key === 'O') onGesture('oui'); // test sur ordinateur
   if (e.key === 'n' || e.key === 'N') onGesture('non');
   if (e.key === 'b' || e.key === 'B') onWave(); // coucou
+  if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
+  if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
   if ((e.key === 'm' || e.key === 'M') && S.mode === 'awake' && !Script.mirrorSaid) P.mirrored = 4; // déclenche la transformation
 });
 addEventListener('resize', resize);
@@ -1016,6 +1254,8 @@ function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now; frameN++;
   track(now, frameN); checkWake(dt, now); update(dt, now); direct(dt, now);
   if (Morph.active) { grabFace(now); Morph.update(now); }
+  if (Hand.active) Hand.update(now);
+  if (Twin.active) Twin.update(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   requestAnimationFrame(loop);
@@ -1023,7 +1263,7 @@ function loop(now) {
 
 resize();
 requestAnimationFrame(loop);
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Script, video }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Script, video }; // pour tester sans caméra
 startCamera().then(ok => {
   P.cam = ok; P.camDone = true;
   if (ok) { S.reflectTarget = 0.5; loadTracker(); }
