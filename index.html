@@ -433,7 +433,9 @@ function checkWake(dt, now) {
   const near = ready && P.face && lit && eyesOpen && P.close > wakeAt() && centered;
   const blurry = P.sharpBase > 0 && P.sharp < P.sharpBase * CFG.LENS_BLUR;
   const onLens = ready && blurry && !P.face && P.lostLit && P.lostClose > wakeAt() * CFG.LENS_RATIO && now - P.lostAt < CFG.LENS_WINDOW_MS;
-  if (near || onLens) P.hold += dt * 1000;
+  // il te connaît déjà : il n'a pas besoin que tu t'approches, il lui suffit de te reconnaître
+  const known = Script.resume && ready && P.face && lit && centered;
+  if (near || onLens || known) P.hold += dt * 1000;
   else P.hold = Math.max(0, P.hold - dt * 1500);
   if (P.hold > CFG.WAKE_HOLD_MS) wake();
 }
@@ -494,6 +496,11 @@ function track(now, frameN) {
     if (closed && !P.blink) { onPlayerBlink(); P.closedAt = now; }
     if (!closed && P.blink && now - P.closedAt > CFG.EYES_SHUT_MS) P.longCloseAt = now;
     P.blink = closed;
+    // tu souris, tu ouvres la bouche : il la prend
+    const smile = (ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2, jaw = ex('jawOpen');
+    if (S.mode === 'awake' && frameN % 10 === 0 && (smile > 0.55 || jaw > 0.35)) {
+      MouthImg.capture(lm, vw, vh, smile + Math.min(jaw, 0.5));
+    }
   }
   // la tête : lacet (non), tangage (oui), roulis (penchée), mesurés dans le repère des yeux
   const ed = Math.hypot(bx - ax, by - ay), ux = (bx - ax) / ed, uy = (by - ay) / ed;
@@ -639,6 +646,7 @@ function twinLum(u, v, gi, gj) {
 // d'autres arrivent, et un côté n'est encore que des morceaux.
 const TEETH = 9;
 function mouthLum(u, v, gi, gj) {
+  if (MouthImg.img) return mouthFromYou(u, v, gi, gj);
   let mu = u / 1.05;
   const mv = v / 1.05 - 0.05;
   if (S.glitch) mu += (hash(gj, S.grain) - 0.5) * 0.1;
@@ -672,6 +680,24 @@ function mouthLum(u, v, gi, gj) {
   if ((mu + 1) / 2 > Mouth.build) L = hash(gi * 3 + S.grain, gj) > 0.9 ? 0.35 * open + 0.08 : L * 0.3;
   L += (hash(gi + S.grain * 41, gj * 5 + S.grain) - 0.5) * 0.1; // grain
   return clamp(L, 0, 1) * env;
+}
+// Ta vraie bouche, prise sur toi : noirs bouchés, blancs durs, grain. Il la construit par morceaux ;
+// ceux qui ne sont pas encore à leur place manquent, ou flottent à côté.
+function mouthFromYou(u, v, gi, gj) {
+  const fu = (u / 1.15) * 0.5 + 0.5, fv = (v / 0.74) * 0.5 + 0.5;
+  if (fu < 0 || fu > 1 || fv < 0 || fv > 1) return 0;
+  const bx = fu * 14 | 0, by = fv * 9 | 0, rb = hash(bx * 7 + 3, by * 13 + 1);
+  let su = fu;
+  if (rb > Mouth.build + 0.15) {
+    if (rb < 0.93) return hash(gi * 3 + S.grain, gj) > 0.92 ? 0.25 : 0; // pas encore là
+    su += (hash(bx, by + S.grain) - 0.5) * 0.15;                       // un morceau qui cherche sa place
+  }
+  if (S.glitch) su += (hash(gj, S.grain) - 0.5) * 0.08;
+  const l = MouthImg.img[clamp(fv * MH | 0, 0, MH - 1) * MW + clamp((1 - su) * MW | 0, 0, MW - 1)];
+  let c = clamp((l - MouthImg.lo) / (MouthImg.hi - MouthImg.lo + 1e-3), 0, 1);
+  c = Math.pow(c * c * (3 - 2 * c), 1.5);
+  const edge = smooth(1, 0.72, Math.hypot((fu - 0.5) / 0.5, (fv - 0.5) / 0.5));
+  return clamp(c * edge + (hash(gi + S.grain * 41, gj * 5 + S.grain) - 0.5) * 0.12, 0, 1);
 }
 const Mouth = {
   active: false, t0: 0, build: 0,
@@ -1145,6 +1171,46 @@ const Art = {
   },
 };
 
+// Ta bouche : il la prend sur toi quand tu souris ou que tu l'ouvres, et garde la meilleure (le plus de dents).
+const MW = 112, MH = 72, MOUTH_KEY = 'regard.bouche';
+const mouthC = document.createElement('canvas'); mouthC.width = MW; mouthC.height = MH;
+const mouthX = mouthC.getContext('2d', { willReadFrequently: true });
+const MouthImg = {
+  img: null, lo: 0.1, hi: 0.9, score: 0, dirty: false,
+  capture(lm, vw, vh, score) {
+    if (score <= this.score + 0.05) return;
+    const pts = [61, 291, 0, 17, 13, 14], xs = pts.map(i => lm[i].x * vw), ys = pts.map(i => lm[i].y * vh);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), w = (x1 - x0) * 1.9, h = w * MH / MW;
+    if (w < 24 || w > vw || h > vh) return;
+    const mx = (x0 + x1) / 2, my = (Math.min(...ys) + Math.max(...ys)) / 2;
+    mouthX.drawImage(video, clamp(mx - w / 2, 0, vw - w), clamp(my - h / 2, 0, vh - h), w, h, 0, 0, MW, MH);
+    const d = mouthX.getImageData(0, 0, MW, MH).data, f = new Float32Array(MW * MH);
+    for (let i = 0; i < MW * MH; i++) f[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    this.set(f); this.score = score; this.dirty = true;
+  },
+  set(f) {
+    const smp = Array.from(f).filter((_, i) => i % 5 === 0).sort((a, b) => a - b);
+    this.img = f; this.lo = smp[smp.length * 0.08 | 0]; this.hi = smp[smp.length * 0.97 | 0];
+  },
+  save() {
+    if (!this.img || !this.dirty) return;
+    try {
+      let s = '';
+      for (let i = 0; i < this.img.length; i++) s += String.fromCharCode(Math.round(this.img[i] * 255));
+      localStorage.setItem(MOUTH_KEY, btoa(s)); this.dirty = false;
+    } catch (e) { /* plein ou refusé */ }
+  },
+  load() {
+    try {
+      const s = atob(localStorage.getItem(MOUTH_KEY) || '');
+      if (s.length !== MW * MH) return;
+      const f = new Float32Array(MW * MH);
+      for (let i = 0; i < s.length; i++) f[i] = s.charCodeAt(i) / 255;
+      this.set(f); this.score = 0.6; // une bouche déjà prise : il n'en reprend une que si tu montres plus de dents
+    } catch (e) { /* rien de gardé */ }
+  },
+};
+
 // La seule fenêtre du jeu : tu lui écris. Elle se ferme quand tu valides, ou si tu ne dis rien.
 function askText(ms) {
   return new Promise(resolve => {
@@ -1552,6 +1618,7 @@ const Script = {
     while (Mouth.active) await sleep(100);
     await sleep(900);
     await sayNow(['Elle n’est pas encore terminée.', 'Il me manque des dents.']);
+    if (MouthImg.img) { await sleep(1600); await type('Je l’ai prise sur toi.'); }
     Script.mouthShown = true;
     Save.checkpoint();
   },
@@ -1738,7 +1805,7 @@ addEventListener('pointerdown', e => {
   if (debugOn && e.clientX > innerWidth - 90 && e.clientY < 90) {
     const t = performance.now();
     taps = taps.filter(x => t - x < 700); taps.push(t);
-    if (taps.length >= 3) { Save.cp = null; Save.erase(); location.reload(); }
+    if (taps.length >= 3) { Save.cp = null; MouthImg.dirty = false; Save.erase(); location.reload(); }
     return;
   }
   P.pointer = { x: e.clientX * dpr, y: e.clientY * dpr };
@@ -1803,10 +1870,13 @@ const Save = {
   },
   // `at` : la dernière fois que tu étais là
   flush() {
+    MouthImg.save(); // ta bouche, s'il vient de la prendre
     if (!this.cp) return;
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
   },
-  erase() { try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* rien à effacer */ } },
+  erase() {
+    try { [SAVE_KEY, ART_KEY, MOUTH_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
+  },
 };
 let hiddenAt = 0;
 addEventListener('visibilitychange', () => {
@@ -1845,6 +1915,7 @@ if (saved && !saved.done) {
 } else if (saved) Script.seenBefore = true; // il est déjà allé au bout avec toi
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
+MouthImg.load(); // ta bouche, s'il l'a prise
 
 resize();
 requestAnimationFrame(loop);
