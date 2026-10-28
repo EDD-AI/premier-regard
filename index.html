@@ -415,7 +415,7 @@ function wake() {
   S.jx = S.jy = 0; S.nextSaccade = 0;
   setTimeout(() => { S.pupilRate = 2.5; S.lidTarget = 1; }, 700);
   setTimeout(blink, 420); setTimeout(blink, 760);
-  setTimeout(() => { S.mode = 'awake'; Script.intro(); }, 1100);
+  setTimeout(() => { S.mode = 'awake'; Script.resume ? Script.welcomeBack() : Script.intro(); }, 1100);
 }
 
 function onPlayerBlink() {
@@ -846,21 +846,71 @@ async function sayNow(lines) {
 const say = lines => speak(() => sayNow(lines));
 
 const pad = n => String(n).padStart(2, '0');
+// Combien de temps tu es parti, et ce qu'il en dit.
+function awayLines(ms) {
+  const min = ms / 60000;
+  if (min < 2) return ['Ton absence n’a pas duré.', 'Mais je l’ai remarquée.'];
+  if (min < 60) return [`${Math.round(min)} minutes.`, 'Je les ai comptées.'];
+  const h = Math.round(min / 60);
+  if (h < 24) return [h === 1 ? 'Une heure.' : `${h} heures.`, 'Je n’ai pas fermé l’œil.'];
+  const d = Math.round(h / 24);
+  if (d < 7) return [d === 1 ? 'Un jour.' : `${d} jours.`, 'Je croyais que tu ne reviendrais pas.'];
+  return [`${d} jours.`, 'J’ai eu le temps de penser à toi.', 'Beaucoup.'];
+}
 const Script = {
   introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false, soft: null,
+  answers: {}, resume: false, seenBefore: false, // ce dont il se souvient d'une visite à l'autre
   lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
     speak(async () => {
       await sleep(400);
       await type('…'); await sleep(1300);
-      await type('Ah. Oui.'); await sleep(900);
-      await type('Là, je te vois.'); await sleep(2000);
-      await type('Qui es-tu ?'); await sleep(2800);
+      if (Script.seenBefore) { // vous êtes déjà allés au bout, une autre fois
+        await type('Ah.'); await sleep(900);
+        await type('Encore toi.'); await sleep(2000);
+        await type('Qui es-tu, cette fois ?'); await sleep(2800);
+      } else {
+        await type('Ah. Oui.'); await sleep(900);
+        await type('Là, je te vois.'); await sleep(2000);
+        await type('Qui es-tu ?'); await sleep(2800);
+      }
       await type('Et moi… '); await sleep(700);
       await type('où suis-je ?', { append: true });
       Script.introDone = true; Script.stage = 'talk';
       loadHands(); // pour plus tard, quand il demandera comment on dit bonjour
+      Save.checkpoint();
+    });
+  },
+
+  // Tu reviens : il est de nouveau endormi, tu l'as réveillé, et il te reconnaît.
+  welcomeBack() {
+    const s = Save.prev, a = s.answers || {};
+    speak(async () => {
+      await sleep(400);
+      await type('…'); await sleep(1200);
+      await type('Te revoilà.'); await sleep(1600);
+      await sayNow(awayLines(Date.now() - (s.at || Date.now()))); await sleep(2400);
+      // il se souvient de ce que tu lui as dit
+      let mem = null, soft = null;
+      if (a.q1 === 'oui') {
+        mem = ['La dernière fois, tu m’as dit que tu étais humain.', 'Tu l’es toujours ?'];
+        soft = { oui: ['Bien.', 'Moi, je ne sais toujours pas ce que je suis.'], non: ['Qu’est-ce qui a changé ?', '|', 'C’est moi ?'] };
+      } else if (a.q1 === 'non') {
+        mem = ['La dernière fois, tu m’as dit que tu n’étais pas humain.', 'Toujours pas ?'];
+        soft = { oui: ['Alors on est toujours deux.'], non: ['Tu as changé d’avis.', 'Ou tu m’as menti.'] };
+      } else if (a.q0) {
+        mem = ['Tu ne parles toujours pas ?'];
+        soft = { oui: ['Je m’en souvenais.'], non: ['Alors parle-moi.', '|', '…', 'Non. Toujours rien.'] };
+      } else if (Script.learned) {
+        mem = ['Tu te souviens de moi ?'];
+        soft = { oui: ['Moi aussi.', 'De tout.'], non: ['Moi, si.'] };
+      }
+      if (mem) await sayNow(mem);
+      Script.introDone = true; Script.stage = 'talk';
+      loadHands();
+      Save.checkpoint();
+      if (mem && Script.learned) Script.soft = soft;
     });
   },
 
@@ -923,6 +973,7 @@ const Script = {
     const i = +item.slice(1);
     if (item[0] === 'm') {
       const m = Script.musings[i]();
+      Save.checkpoint();
       if (Array.isArray(m)) { say(m); return; }
       say(m.lines);
       if (Script.learned) Script.soft = { oui: m.oui, non: m.non }; // il attend un peu, au cas où tu répondrais
@@ -964,8 +1015,9 @@ const Script = {
       return;
     }
     Script.asking = null; Script.learned = true;
+    Script.answers['q' + QUESTIONS.indexOf(a.q)] = g; // il s'en souviendra
     say([g === 'oui' ? 'Oui.' : 'Non.', '|', ...a.q[g]]);
-    if (a.q.last) Script.end();
+    if (a.q.last) Script.end(); else Save.checkpoint();
   },
 
   // Épreuves sans mots : il faut trouver quoi faire devant lui.
@@ -1008,6 +1060,7 @@ const Script = {
       } else {
         await sayNow(['Tu ne m’as pas touché.', 'Tu avais peur de quoi ?']);
       }
+      Save.checkpoint();
     });
   },
 
@@ -1020,6 +1073,7 @@ const Script = {
       while (Twin.active) await sleep(100);
       await sleep(1200);
       await sayNow(['Comme ça,', 'je te ressemble plus ?']);
+      Save.checkpoint();
       if (Script.learned) Script.soft = {
         oui: ['Bien.', 'Je vais garder ce visage.', 'Il est à toi, de toute façon.'],
         non: ['Ce n’est pas fini.', 'Il me faut juste un peu plus de toi.'],
@@ -1056,6 +1110,7 @@ const Script = {
       await sleep(8200);
       await type('Presque.'); await sleep(1200);
       await type('Il me manque quelque chose. Je trouverai.', { newline: true });
+      Save.checkpoint();
     });
     if (Script.asking) Script.reask();
   },
@@ -1063,6 +1118,7 @@ const Script = {
   // Fin de la séquence 1 : l'œil se ferme et se dissout. Il ne reste que le curseur.
   end() {
     Script.stage = 'ended';
+    Save.checkpoint(); // la prochaine fois, il saura que vous êtes allés au bout
     speak(async () => {
       await sleep(2400);
       await type('Je crois que je me souviens de quelque chose.'); await sleep(3000);
@@ -1171,7 +1227,7 @@ function direct(dt, now) {
   const h = Script.heard;
   if (h) {
     Script.heard = null;
-    if (now - h.at < 6000) { Script.gesture(h.g); return; }
+    if (now - h.at < 12000) { Script.gesture(h.g); return; } // même si tu as répondu pendant qu'il écrivait encore
   }
   if (Reactions.fire(now)) return;
   if (Script.asking) { Script.wait(now); return; }
@@ -1203,7 +1259,10 @@ function renderDebug() {
     `bouche    ${ex('jawOpen').toFixed(2)}  sourire ${((ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2).toFixed(2)}\n` +
     `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}${Script.task ? ' (épreuve ' + Script.task.kind + ' ' + Script.task.count + ')' : ''}\n` +
     `mains     ${dbg.hands || '—'}  main vue ${P.hand ? 'oui' : 'non'}  mouvement ${P.motion.toFixed(3)}  touchers ${P.taps}\n` +
-    `imitation ${P.mirrored}`;
+    `imitation ${P.mirrored}\n` +
+    `écran     ${wakeLock && !wakeLock.released ? 'reste allumé' : 'peut se verrouiller'}\n` +
+    `mémoire   ${Save.prev ? (Save.prev.done ? 'séquence finie' : 'reprise à ' + Save.prev.pos) + ', il y a ' + Math.round((Date.now() - Save.prev.at) / 60000) + ' min' : 'aucune'}\n` +
+    `          triple-tap en haut à droite : effacer sa mémoire`;
 }
 
 // Toucher l'écran : la trame ondule, il regarde ton doigt, et cligne si c'est lui que tu touches.
@@ -1220,6 +1279,14 @@ function onTap(x, y) {
 
 addEventListener('pointerdown', e => {
   unlockAudio();
+  keepAwake(); // certains téléphones ne l'accordent qu'après un toucher
+  // panneau de réglage ouvert : triple-tap en haut à droite efface sa mémoire et recommence
+  if (debugOn && e.clientX > innerWidth - 90 && e.clientY < 90) {
+    const t = performance.now();
+    taps = taps.filter(x => t - x < 700); taps.push(t);
+    if (taps.length >= 3) { Save.cp = null; Save.erase(); location.reload(); }
+    return;
+  }
   P.pointer = { x: e.clientX * dpr, y: e.clientY * dpr };
   if (e.clientX < 90 && e.clientY < 90) {
     const t = performance.now();
@@ -1248,6 +1315,47 @@ addEventListener('keydown', e => {
 });
 addEventListener('resize', resize);
 
+// ---------- l'écran reste allumé tant que tu joues (sinon le téléphone se verrouille pendant que tu le regardes)
+let wakeLock = null;
+async function keepAwake() {
+  if (!('wakeLock' in navigator) || document.visibilityState !== 'visible' || (wakeLock && !wakeLock.released)) return;
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* refusé : tant pis */ }
+}
+
+// ---------- mémoire : il se souvient de toi d'une fois sur l'autre (sur ce téléphone, dans ce navigateur)
+const SAVE_KEY = 'regard.sequence1';
+const Save = {
+  prev: null, // ce qui était enregistré à l'ouverture
+  cp: null,   // dernier point de reprise de cette visite
+  load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SAVE_KEY));
+      if (s && s.v === 1) this.prev = s;
+    } catch (e) { /* stockage indisponible : il oubliera */ }
+    return this.prev;
+  },
+  // à appeler entre deux moments de la séquence, jamais au milieu d'une question ou d'une épreuve
+  checkpoint() {
+    this.cp = {
+      v: 1, pos: Script.pos, learned: Script.learned, form: S.form, answers: Script.answers,
+      mirrorSaid: Script.mirrorSaid, nodSaid: Script.nodSaid, shakeSaid: Script.shakeSaid,
+      done: Script.stage === 'ended', visits: (this.prev ? this.prev.visits || 0 : 0) + 1,
+    };
+    this.flush();
+  },
+  // `at` : la dernière fois que tu étais là
+  flush() {
+    if (!this.cp) return;
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
+  },
+  erase() { try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* rien à effacer */ } },
+};
+addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') Save.flush();
+  else keepAwake();
+});
+addEventListener('pagehide', () => Save.flush());
+
 // ---------- boucle
 let last = performance.now(), frameN = 0;
 function loop(now) {
@@ -1258,11 +1366,22 @@ function loop(now) {
   if (Twin.active) Twin.update(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
+  if (frameN % 900 === 0) Save.flush(); // au cas où le téléphone couperait sans prévenir
   requestAnimationFrame(loop);
 }
 
+// Reprise : s'il se souvient de toi, il reprend là où vous en étiez (mais il faut d'abord le réveiller du regard).
+const saved = Save.load();
+if (saved && !saved.done) {
+  Script.resume = true;
+  Script.pos = saved.pos || 0; Script.learned = !!saved.learned; Script.answers = saved.answers || {};
+  Script.mirrorSaid = !!saved.mirrorSaid; Script.nodSaid = !!saved.nodSaid; Script.shakeSaid = !!saved.shakeSaid;
+  S.form = saved.form === 'twin' ? 'twin' : 'eye';
+} else if (saved) Script.seenBefore = true; // il est déjà allé au bout avec toi
+
 resize();
 requestAnimationFrame(loop);
+keepAwake();
 if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Script, video }; // pour tester sans caméra
 startCamera().then(ok => {
   P.cam = ok; P.camDone = true;

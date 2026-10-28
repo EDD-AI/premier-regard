@@ -17,3 +17,9 @@ Un jeu mobile : un œil dans ton téléphone. On le retrouvera au fil de nombreu
 - Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), D affiche le panneau de réglage.
 - Triple-tap en haut à gauche : panneau de réglage caché.
 - Pour jouer sans barre de navigateur : « Ajouter à l'écran d'accueil ».
+
+## Mémoire
+
+- L'écran reste allumé pendant le jeu (le téléphone ne se verrouille pas pendant qu'on regarde l'œil).
+- La progression est gardée sur le téléphone. Au retour, l'œil est de nouveau endormi : on le réveille du regard, il reconnaît le joueur, dit combien de temps il est parti, se souvient de ses réponses et reprend où on en était.
+- Pour tout effacer : ouvrir le panneau de réglage (triple-tap en haut à gauche), puis triple-tap en haut à droite.
