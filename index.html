@@ -52,6 +52,20 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
   position:fixed;margin:0;top:calc(env(safe-area-inset-top,0px) + 8px);left:max(12px,env(safe-area-inset-left,0px));
   font:12px/1.4 var(--font-debug);color:var(--dim);white-space:pre;pointer-events:none;
 }
+/* La seule fenêtre du jeu : quand il te demande ce que c'est, tu lui écris. */
+#ask{
+  position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 4vh);margin:0;
+  width:min(84vw,420px);display:flex;align-items:center;gap:.4em;padding:.35em .6em;
+  border:1px solid var(--voice);background:var(--void);
+  font-family:var(--font-voice);font-size:clamp(22px,6.4vw,34px);color:var(--voice);
+}
+#ask[hidden]{display:none}
+#ask span{flex:none}
+#askInput{
+  flex:1;min-width:0;border:0;outline:0;background:transparent;padding:0;margin:0;
+  font:inherit;color:inherit;text-transform:uppercase;letter-spacing:.06em;caret-color:var(--voice);
+  -webkit-user-select:text;user-select:text;touch-action:manipulation;
+}
 @media (prefers-reduced-motion:reduce){#voice .cursor{animation:none}}
 </style>
 </head>
@@ -59,6 +73,10 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
 <canvas id="eye" aria-label="Un œil, immobile"></canvas>
 <video id="cam" playsinline muted autoplay></video>
 <p id="voice" aria-live="polite"></p>
+<form id="ask" hidden autocomplete="off">
+  <span aria-hidden="true">&gt;</span>
+  <input id="askInput" name="askInput" type="text" maxlength="40" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" aria-label="Ta réponse">
+</form>
 <pre id="debug" hidden></pre>
 
 <script>
@@ -89,6 +107,8 @@ const CFG = {
   WAVE_MOTION: 0.05,    // si le suivi des mains échoue : mouvement de l'image qui vaut un coucou
   TAPS_NEEDED: 5,       // tapotements sur l'écran pour lui montrer à quoi servent tes mains
   HAND_MODEL: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+  OBJ_MODEL: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+  SHOW_HOLD_MS: 1300,   // temps à tenir quelque chose devant lui pour qu'il le voie
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -128,6 +148,7 @@ const S = {
   roll: 0, demo: null, look: null,
   morph: 0, morphKind: 'face', faceFlip: false, glitch: false, // quand il devient toi, une main, ou un visage
   form: 'eye', hx: 0, hy: 0, // 'eye' : un seul œil ; 'twin' : deux yeux et un visage, qui bouge un peu
+  yaw3: 0, pitch3: 0,        // rotation de sa tête, en relief
 };
 const P = {
   cam: false, tracker: false, face: false,
@@ -137,7 +158,8 @@ const P = {
   camDone: false, trackerFailed: false,
   bs: {}, yaw: 0, pitch: 0, roll: 0, closedAt: 0, longCloseAt: -1e9, lastGesture: null,
   faceLight: 0, lostLit: false,
-  motion: 0, hand: false, waveHold: 0, taps: 0,
+  motion: 0, hand: false, waveHold: 0, taps: 0, pitch0: null,
+  shown: null, showHold: 0, // ce que tu lui montres
 };
 const ex = name => P.bs[name] || 0; // score d'une expression du visage, 0..1
 const wakeAt = () => Math.max(CFG.WAKE_MIN, P.base * CFG.WAKE_RATIO);
@@ -159,6 +181,7 @@ function resize() {
   cell = EW / CFG.CELLS_PER_EYE;
   cols = Math.ceil(W / cell); rows = Math.ceil(H / cell);
   ox = (W - cols * cell) / 2; oy = cy - Math.ceil(cy / cell) * cell;
+  if (typeof buildAtlas === 'function' && INK) buildAtlas();
 }
 
 // Image de la caméra réduite à 40×40, pour le reflet dans la pupille et la lumière de la pièce.
@@ -261,6 +284,7 @@ function addRipple(x, y) {
 }
 
 function draw() {
+  if (Gallery.showing) { drawGallery(); return; }
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   ctx.beginPath();
   const g = S.grain, cr = Math.cos(S.roll), sr = Math.sin(S.roll);
@@ -284,6 +308,8 @@ function draw() {
       if (!other) base = S.form === 'twin' ? twinLum(u, v, i, j) : lum(u, v, i, j);
       else if (S.morphKind === 'twin') base = twinLum(u, v, i, j);
       else if (S.morphKind === 'hand') base = handLum(x, y);
+      else if (S.morphKind === 'mouth') base = mouthLum(u0, v0, i, j);
+      else if (S.morphKind === 'void') base = 0;
       else base = faceLum(x, y, j);
       let L = base + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
       // sous ton doigt : les points s'écartent, et un anneau très faible s'étend, même dans le noir
@@ -386,6 +412,11 @@ function update(dt, now) {
   // son visage (quand il en a un) se tourne un peu vers toi, lentement ; ses yeux, eux, te suivent tout de suite
   S.hx += (S.px * 0.3 + Math.sin(now / 1700) * 0.02 - S.hx) * k(2);
   S.hy += (S.py * 0.25 + Math.sin(now / 2300) * 0.015 - S.hy) * k(2);
+  // sa tête se tourne vers toi (gauche, droite, haut, bas) et imite la tienne quand tu la tournes, comme un miroir
+  const lookYaw = (S.tx + S.jx * 0.6) * 0.9 - (P.face ? P.yaw * 1.6 : 0);
+  const lookPitch = S.ty * 1.8 + (P.face && P.pitch0 !== null ? (P.pitch - P.pitch0) * 2.5 : 0);
+  S.yaw3 += (clamp(lookYaw, -0.5, 0.5) - S.yaw3) * k(2.2);
+  S.pitch3 += (clamp(lookPitch, -0.3, 0.3) - S.pitch3) * k(2.2);
 
   // la pupille suit la lumière de ta pièce, et s'ouvre un peu quand tu t'approches
   if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
@@ -432,6 +463,7 @@ function track(now, frameN) {
   if (!landmarker || video.currentTime === lastVT) return;
   lastVT = video.currentTime;
   trackHands(now);
+  trackObjects(now, frameN);
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   const lm = res.faceLandmarks && res.faceLandmarks[0];
@@ -468,6 +500,7 @@ function track(now, frameN) {
   const nx = lm[1].x * vw - (ax + bx) / 2, ny = lm[1].y * vh - (ay + by) / 2;
   P.yaw = (nx * ux + ny * uy) / ed;
   P.pitch = (ny * ux - nx * uy) / ed;
+  P.pitch0 = P.pitch0 === null ? P.pitch : mix(P.pitch0, P.pitch, 0.004); // ta façon habituelle de tenir la tête
   P.roll = Math.atan2(by - ay, bx - ax);
   Gesture.push(now, P.yaw, P.pitch);
   // où est ton visage dans l'image, pour qu'il puisse le prendre
@@ -554,23 +587,39 @@ function faceLum(x, y, j) {
 
 // ---------- son visage
 // Deux yeux enfoncés dans l'ombre, paupières lourdes, une seule lueur : il essaie de te ressembler.
+// La tête tourne en relief : le visage est lu sur une forme arrondie qui pivote (gauche-droite, haut-bas).
+const TR = 1.3, TRV = 1.2; // rayons de la tête, horizontal et vertical : elle pivote sur elle-même plus qu'elle ne glisse
 function twinLum(u, v, gi, gj) {
-  const fu = (u - S.hx) / 1.15, fv = (v - S.hy) / 1.15;
+  const su = (u - S.hx * 0.4) / 1.15, sv = (v - S.hy * 0.4) / 1.15;
+  if (Math.abs(su) >= TR || Math.abs(sv) >= TRV) return 0;
+  const a = Math.asin(su / TR), phi = a - S.yaw3, psi = Math.asin(sv / TRV) - S.pitch3;
+  if (Math.abs(phi) > 1.4 || Math.abs(psi) > 1.3) return 0; // l'arrière de la tête
+  const fu = TR * Math.sin(phi), fv = TRV * Math.sin(psi);
   const env = Math.exp(-((fu / 2.1) ** 4) - ((fv / 0.9) ** 4));
   if (env < 0.01) return 0;
-  const side = fu < 0 ? -1 : 1, ex = Math.abs(fu) - 0.62;
+  // ce qui dépasse (nez, arcades) glisse plus que la peau quand il tourne ; ce qui est enfoncé (les yeux) glisse moins
+  const st = Math.sin(S.yaw3), sp = Math.sin(S.pitch3);
+  const eu = fu + 0.12 * st, ev = fv + 0.1 * sp;   // orbites et yeux, en retrait
+  const nu = fu - 0.24 * st, nv = fv - 0.2 * sp;   // le nez, en avant
+  const side = eu < 0 ? -1 : 1, ex = Math.abs(eu) - 0.62;
   // peau : lumière d'en haut, plus forte au centre
   let L = 0.5 + 0.12 * noise(fu * 3 + 5, fv * 3) - 0.18 * fv;
   // orbites : grandes ombres
-  L *= 1 - 0.88 * smooth(1.05, 0.45, Math.hypot(ex / 0.44, (fv + 0.02) / 0.3));
+  L *= 1 - 0.88 * smooth(1.05, 0.45, Math.hypot(ex / 0.44, (ev + 0.02) / 0.3));
   // arcades et sourcils, sombres
-  L *= 1 - 0.55 * Math.exp(-(((fv + 0.36 + 0.06 * ex * ex) / 0.07) ** 2)) * smooth(0.75, 0.2, Math.abs(ex));
-  // arête du nez, éclairée
-  L += 0.38 * Math.exp(-((fu / 0.085) ** 2)) * smooth(-0.35, 0.2, fv) * smooth(0.95, 0.5, fv);
+  const bex = Math.abs(fu - 0.05 * st) - 0.62, bv = fv - 0.05 * sp;
+  L *= 1 - 0.55 * Math.exp(-(((bv + 0.36 + 0.06 * bex * bex) / 0.07) ** 2)) * smooth(0.75, 0.2, Math.abs(bex));
+  // arête du nez, éclairée ; son ombre, du côté vers lequel il tourne, donne le relief
+  const noseV = smooth(-0.35, 0.2, nv) * smooth(0.95, 0.5, nv);
+  L += 0.38 * Math.exp(-((nu / 0.085) ** 2)) * noseV;
+  L *= 1 - 0.5 * Math.min(1, Math.abs(st) * 2.2) * Math.exp(-(((nu - Math.sign(st) * 0.13) / 0.07) ** 2)) * noseV;
   // pommettes
-  L += 0.16 * Math.exp(-((ex + 0.05) ** 2 / 0.08 + (fv - 0.42) ** 2 / 0.03));
+  const cex = Math.abs(fu - 0.08 * st) - 0.62;
+  L += 0.16 * Math.exp(-((cex + 0.05) ** 2 / 0.08 + (fv - 0.42) ** 2 / 0.03));
+  // les côtés qui fuient s'assombrissent
+  L *= 0.45 + 0.55 * Math.pow(Math.cos(a), 0.5);
   // les yeux : presque noirs ; seuls la paupière du bas et un reflet accrochent la lumière
-  const dx = fu - side * 0.62, dy = fv - 0.04, at = 1 - (dx / 0.3) ** 2;
+  const dx = eu - side * 0.62, dy = ev - 0.04, at = 1 - (dx / 0.3) ** 2;
   if (at > 0) {
     const sq = Math.sqrt(at), bot = 0.055 * sq, top = bot - 0.135 * sq * S.open * 0.8;
     L += 0.45 * Math.exp(-(((dy - bot - 0.02) / 0.02) ** 2)) * at;
@@ -585,6 +634,58 @@ function twinLum(u, v, gi, gj) {
   L += (hash(gi + S.grain * 57, gj * 7 + S.grain) - 0.5) * 0.22; // grain, comme une photo poussée
   return clamp(L, 0, 1) * env * S.bright;
 }
+// ---------- sa bouche, pas encore finie
+// Un sourire de dents dans le noir, la lèvre du bas éclairée. Il la construit devant toi : des dents manquent,
+// d'autres arrivent, et un côté n'est encore que des morceaux.
+const TEETH = 9;
+function mouthLum(u, v, gi, gj) {
+  let mu = u / 1.05;
+  const mv = v / 1.05 - 0.05;
+  if (S.glitch) mu += (hash(gj, S.grain) - 0.5) * 0.1;
+  const env = Math.exp(-((mu / 1.5) ** 4) - ((mv / 0.75) ** 4));
+  if (env < 0.01) return 0;
+  const open = Math.max(0, 1 - mu * mu), so = Math.sqrt(open);
+  const curve = 0.16 * mu * mu - 0.1;                 // la ligne du sourire, qui remonte aux coins
+  const top = curve - 0.02, bot = curve + 0.36 * so + 0.02;
+  // peau : dans l'ombre, sauf les lèvres et le menton
+  let L = 0.1 + 0.08 * noise(mu * 4 + 9, mv * 4);
+  L += 0.45 * Math.exp(-(((mv - bot - 0.06) / 0.05) ** 2)) * open;   // lèvre du bas, éclairée
+  L += 0.25 * Math.exp(-(((mv - top + 0.07) / 0.035) ** 2)) * open;  // lèvre du haut, un fil de lumière
+  L += 0.2 * smooth(bot + 0.15, bot + 0.45, mv) * Math.max(0, 1 - Math.abs(mu)); // menton
+  if (open > 0 && mv > top && mv < bot) {
+    L = 0.03; // le noir de la bouche
+    // dents du haut
+    const k = Math.floor((mu + 1) / 2 * TEETH), xc = -1 + (k + 0.5) * 2 / TEETH;
+    const w = 0.85 / TEETH * (1 - 0.25 * Math.abs(xc)), tc = 0.16 * xc * xc - 0.1, th = 0.17 * (1 - 0.4 * Math.abs(xc));
+    if ((k + 0.5) / TEETH < Mouth.build && hash(k, 77) > 0.22 && Math.abs(mu - xc) < w && mv > tc && mv < tc + th) {
+      const r = Math.max(0, (mv - (tc + th - 0.04)) / 0.04), dx = Math.abs(mu - xc) / w;
+      if (dx * dx + r * r < 1) L = (0.92 - 0.35 * Math.abs(xc)) * (0.7 + 0.3 * smooth(tc, tc + 0.05, mv));
+    }
+    // dents du bas, plus petites, à moitié cachées
+    const k2 = Math.floor((mu + 1) / 2 * (TEETH + 1)), xc2 = -1 + (k2 + 0.5) * 2 / (TEETH + 1);
+    const w2 = 0.8 / (TEETH + 1) * (1 - 0.3 * Math.abs(xc2)), lc = 0.16 * xc2 * xc2 - 0.1 + 0.25 * Math.sqrt(Math.max(0, 1 - xc2 * xc2));
+    if ((k2 + 0.5) / (TEETH + 1) < Mouth.build - 0.08 && hash(k2, 91) > 0.3 && Math.abs(mu - xc2) < w2 && mv > lc && mv < lc + 0.09) {
+      L = 0.62 - 0.3 * Math.abs(xc2);
+    }
+  }
+  // la partie pas encore construite : des morceaux qui cherchent leur place
+  if ((mu + 1) / 2 > Mouth.build) L = hash(gi * 3 + S.grain, gj) > 0.9 ? 0.35 * open + 0.08 : L * 0.3;
+  L += (hash(gi + S.grain * 41, gj * 5 + S.grain) - 0.5) * 0.1; // grain
+  return clamp(L, 0, 1) * env;
+}
+const Mouth = {
+  active: false, t0: 0, build: 0,
+  start(now) { this.active = true; this.t0 = now; this.build = 0.3; },
+  update(now) {
+    const t = (now - this.t0) / 1000;
+    S.morphKind = 'mouth';
+    this.build = 0.3 + 0.52 * clamp((t - 0.8) / 4, 0, 1); // elle ne sera pas finie, pas encore
+    S.morph = t < 1.3 ? t / 1.3 : t < 7.5 ? 1 : Math.max(0, 1 - (t - 7.5) / 1.2);
+    S.glitch = t > 7.3 && t < 7.6;
+    if (t > 8.8) { this.active = false; S.morph = 0; S.glitch = false; }
+  },
+};
+
 const Twin = {
   active: false, t0: 0,
   start(now) { this.active = true; this.t0 = now; },
@@ -595,6 +696,178 @@ const Twin = {
     if (t > 2.7) { this.active = false; S.form = 'twin'; S.morph = 0; }
   },
 };
+
+// ---------- ce qu'il trouve beau
+// Des images qui bougent, recréées dans sa trame : colombes, la Création d'Adam (Michel-Ange), une fleur,
+// une femme, la Grande Vague (Hokusai), puis ce que tu lui as montré. Coordonnées : unités du petit côté de l'écran,
+// centrées. Certaines en points, d'autres en caractères.
+function dove(gx, gy, bx, by, s, ph, dir) {
+  const lx = (gx - bx) / s * dir, ly = (gy - by) / s;
+  if (Math.abs(lx) > 1 || Math.abs(ly) > 1) return 0;
+  const tip = -0.62 * Math.sin(ph);                                     // le battement d'ailes
+  let d = Math.hypot(lx / 0.34, ly / 0.12) * 0.12 - 0.12;                // corps
+  d = Math.min(d, Math.hypot(lx - 0.33, ly + 0.07) - 0.075);             // tête
+  d = Math.min(d, cap(lx, ly, -0.25, 0.01, -0.55, 0.07, 0.06, 0.11));    // queue
+  for (const f of [-0.13, 0, 0.13]) {                                    // deux ailes, en éventail de plumes
+    d = Math.min(d, cap(lx, ly, 0.06, -0.04, 0.24 + f, tip + Math.abs(f) * 0.6, 0.11, 0.025));
+    d = Math.min(d, cap(lx, ly, -0.06, -0.04, -0.16 + f, tip * 0.92 - 0.04 + Math.abs(f) * 0.5, 0.1, 0.025));
+  }
+  d += (noise(lx * 18 + bx * 9, ly * 18) - 0.5) * 0.06;                  // plumes
+  return smooth(0.02, -0.06, d) * 0.95 + 0.35 * Math.exp(-Math.max(d, 0) / 0.08); // et leur lueur
+}
+function handAt(gx, gy, tx, ty, ang, hs) {
+  const dx = gx - tx, dy = gy - ty, c = Math.cos(ang), s = Math.sin(ang), flip = c < 0 ? -1 : 1;
+  const lx = (dx * c + dy * s) / hs + 1.6, ly = (-dx * s + dy * c) / hs * flip - 0.215;
+  if (lx < -3.2 || lx > 1.9 || Math.abs(ly) > 0.75) return 0;
+  const d = handSDF(lx, ly);
+  if (d > 0.02) return 0;
+  return smooth(0.02, -0.14, d) * (0.5 + 0.5 * clamp(0.45 - ly * 1.2, 0, 1)) * (0.75 + 0.25 * noise(lx * 9, ly * 9)) * 0.95;
+}
+const SLIDES = {
+  doves: { fine: true, lum(gx, gy, t) {
+    let L = 0;
+    for (const [bx, by, s, p, dir] of [[-0.18, -0.45, 0.3, 0, 1], [0.16, -0.12, 0.34, 1.7, -1], [-0.06, 0.25, 0.32, 3.1, 1], [0.18, 0.58, 0.28, 4.4, -1]]) {
+      L = Math.max(L, dove(gx, gy, bx + 0.03 * Math.sin(t * 0.5 + p) + t * 0.012 * dir, by - t * 0.02, s, t * 7 + p, dir));
+    }
+    return L;
+  } },
+  hands: { fine: true, lum(gx, gy, t) { // elles s'approchent, sans jamais se toucher
+    const gap = 0.05 + 0.025 * Math.sin(t * 0.8);
+    return Math.max(handAt(gx, gy, gap / 2, 0.0, Math.PI + 0.06, 0.2), handAt(gx, gy, -gap / 2, 0.05, 0.12, 0.2));
+  } },
+  flower: { ramp: 'fine', lum(gx, gy, t) {
+    const fx = 0.02 + 0.015 * Math.sin(t * 0.6), fy = -0.22;
+    let L = 0;
+    const sy = clamp((gy - fy) / 0.9, 0, 1);                                    // la tige
+    if (gy > fy && gy < fy + 0.95) L = 0.55 * smooth(0.024, 0.008, Math.abs(gx - fx - 0.12 * sy * sy));
+    const dx = gx - fx, dy = gy - fy, r = Math.hypot(dx, dy), a = Math.atan2(dy, dx);
+    const breathe = 1 + 0.04 * Math.sin(t * 1.3);
+    for (let k = 0; k < 6; k++) {                                              // six pétales qui respirent
+      const pa = k * Math.PI / 3 + 0.3 + 0.04 * Math.sin(t * 0.7 + k);
+      const da = Math.atan2(Math.sin(a - pa), Math.cos(a - pa));
+      const along = r * Math.cos(da), across = r * Math.sin(da), len = 0.36 * breathe * (k % 2 ? 0.9 : 1);
+      if (along <= 0 || along >= len) continue;
+      const w = 0.1 * Math.pow(Math.sin(along / len * Math.PI), 0.8);
+      if (Math.abs(across) < w) L = Math.max(L, 0.2 + (0.45 + 0.35 * (1 - along / len) + 0.12 * Math.sin(across * 90)) * smooth(w, w * 0.6, Math.abs(across)));
+    }
+    return clamp(Math.max(L, 0.9 * smooth(0.045, 0.02, r)), 0, 1);             // le cœur
+  } },
+  woman: { ramp: 'body', lum(gx, gy, t) {
+    const x = gx - 0.012 * Math.sin(t * 0.8) * (0.6 - gy), y = gy;              // elle se balance à peine
+    let d = Math.hypot(x, y + 0.7) - 0.07;                                      // tête
+    d = Math.min(d, Math.hypot((x + 0.015) / 1.1, y + 0.72) - 0.085);          // cheveux
+    d = smin(d, cap(x, y, 0, -0.63, 0, -0.56, 0.028, 0.032), 0.02);            // cou
+    d = smin(d, cap(x, y, 0, -0.54, 0, -0.18, 0.1, 0.075), 0.04);              // buste
+    d = smin(d, Math.hypot(x / 0.12, (y + 0.08) / 0.09) * 0.09 - 0.09, 0.04);   // hanches
+    d = Math.min(d, cap(x, y, 0.085, -0.5, 0.17, -0.66, 0.032, 0.028));         // bras levé
+    d = Math.min(d, cap(x, y, 0.17, -0.66, 0.05, -0.79, 0.026, 0.022));         // main sur la tête
+    d = Math.min(d, cap(x, y, -0.09, -0.5, -0.12, -0.3, 0.03, 0.026));          // l'autre bras
+    d = Math.min(d, cap(x, y, -0.12, -0.3, -0.1, -0.1, 0.026, 0.02));
+    d = smin(d, cap(x, y, -0.05, -0.04, -0.055, 0.4, 0.055, 0.04), 0.03);       // jambes
+    d = Math.min(d, cap(x, y, -0.055, 0.4, -0.06, 0.82, 0.04, 0.028));
+    d = smin(d, cap(x, y, 0.05, -0.04, 0.065, 0.4, 0.055, 0.04), 0.03);
+    d = Math.min(d, cap(x, y, 0.065, 0.4, 0.06, 0.82, 0.04, 0.028));
+    if (d > 0.01) return 0;
+    return clamp(0.3 + 0.55 * smooth(-0.06, 0.09, x) + 0.15 * noise(x * 30, y * 30), 0, 1) * smooth(0.01, -0.03, d);
+  } },
+  wave: { ramp: 'wave', lum(gx, gy, t) {
+    const bw = 0.47, bh = 0.3, ax = Math.abs(gx), ay = Math.abs(gy);
+    if ((Math.abs(ax - bw) < 0.007 && ay < bh) || (Math.abs(ay - bh) < 0.007 && ax < bw)) {  // le cadre, en pointillés
+      return Math.floor((gx + gy) * 70) % 2 ? 0.3 : 0;
+    }
+    if (ax > bw - 0.015 || ay > bh - 0.015) return 0;
+    const x = gx / bw, y = gy / bh, drift = 0.04 * Math.sin(t * 0.45);
+    const crest = 0.55 - 1.25 * Math.exp(-(((x + 0.35 - drift) / 0.42) ** 2));          // la grande vague
+    const small = 0.5 - 0.45 * Math.exp(-(((x - 0.55) / 0.18) ** 2)) + 0.03 * Math.sin(t * 1.2);
+    const sea = 0.5 + 0.06 * Math.sin(x * 7 + t * 1.6) + 0.04 * Math.sin(x * 13 - t * 2.1);
+    const surface = Math.min(crest, small, sea);
+    let L = 0.5;                                                                         // le ciel
+    if (y > 0.12 && y < 0.5 && Math.abs(x - 0.18) < (y - 0.12) * 0.9) L = y < 0.2 ? 0.95 : 0.2; // le Fuji, au loin
+    if (y > surface) L = y - surface < 0.07 ? 0.95 : 0.22 + 0.2 * Math.max(0, Math.sin(x * 22 + y * 9 + t * 2));
+    // la lèvre qui s'enroule, et l'écume en griffes au bout
+    const lx = x + 0.1 - drift, ly = y + 0.55, rr = Math.hypot(lx, ly), an = Math.atan2(ly, lx);
+    if (an > -2.6 && an < 0.5 && Math.abs(rr - 0.32) < 0.07 && y < 0.25) L = 0.95;
+    for (let k = 0; k < 5; k++) {
+      const ca = 0.5 + k * 0.25, cx2 = 0.32 * Math.cos(ca) - 0.1 + drift, cy2 = 0.32 * Math.sin(ca) - 0.55;
+      if (Math.hypot(x - cx2, y - cy2) < 0.05 + 0.015 * Math.sin(t * 3 + k)) L = 0.95;
+    }
+    return L;
+  } },
+  yours: { fine: true, lum(gx, gy) { // ce que tu lui as montré, comme dans un miroir
+    if (!Art.img) return 0;
+    const u = gx / 0.84 + 0.5, v = gy / 0.84 + 0.5, r = Math.hypot((u - 0.5) / 0.5, (v - 0.5) / 0.5);
+    if (r > 1) return 0;
+    const l = Art.img[clamp(v * AN | 0, 0, AN - 1) * AN + clamp((1 - u) * AN | 0, 0, AN - 1)];
+    return Math.pow(clamp((l - Art.lo) / (Art.hi - Art.lo + 1e-3), 0, 1), 1.2) * smooth(1, 0.8, r);
+  } },
+};
+
+// Les caractères, dessinés une fois dans une planche, puis recopiés case par case.
+const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@' };
+const atlas = {};
+function buildAtlas() {
+  const gc = Math.ceil(cell * 1.5);
+  for (const [name, ramp] of Object.entries(RAMPS)) {
+    const c = document.createElement('canvas'); c.width = gc * ramp.length; c.height = gc;
+    const g = c.getContext('2d');
+    g.fillStyle = INK; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = `${Math.round(gc * 1.15)}px VT323, ui-monospace, monospace`;
+    for (let k = 0; k < ramp.length; k++) g.fillText(ramp[k], k * gc + gc / 2, gc / 2);
+    atlas[name] = { c, gc, n: ramp.length };
+  }
+}
+
+// Le diaporama : son visage se dissout dans le noir, les images passent en se fondant l'une dans l'autre, son visage revient.
+const SLIDE_S = 5.5;
+const Gallery = {
+  active: false, showing: false, t0: 0, t: 0, slides: [], idx: 0, prog: 1, done: null,
+  play(slides) {
+    return new Promise(resolve => {
+      Object.assign(this, { slides, idx: -1, t0: performance.now(), active: true, done: resolve });
+    });
+  },
+  update(now) {
+    const t = this.t = (now - this.t0) / 1000, n = this.slides.length, end = 1.2 + n * SLIDE_S;
+    S.morphKind = 'void';
+    if (t < 1.2) { S.morph = t / 1.2; this.showing = false; return; }
+    if (t < end) {
+      S.morph = 1; this.showing = true;
+      const k = (t - 1.2) / SLIDE_S, idx = Math.floor(k);
+      if (idx !== this.idx) { this.idx = idx; voice.textContent = this.slides[idx].caption || ''; }
+      this.prog = clamp((k - idx) * SLIDE_S / 0.9, 0, 1);
+      return;
+    }
+    this.showing = false; voice.textContent = '';
+    S.morph = Math.max(0, 1 - (t - end) / 1.2);
+    if (t > end + 1.3) { this.active = false; S.morph = 0; this.done(); }
+  },
+};
+function drawGallery() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const cur = Gallery.slides[Gallery.idx], prev = Gallery.slides[Gallery.idx - 1] || null, t = Gallery.t, g = S.grain;
+  // trame fine pour les images en points, plus grosse pour celles en caractères (pour qu'on les lise)
+  const gc = cur.fine ? Math.ceil(cell) : Math.ceil(cell * 1.5), cols2 = Math.ceil(W / gc), rows2 = Math.ceil(H / gc), M = Math.min(W, H);
+  ctx.beginPath();
+  for (let j = 0; j < rows2; j++) {
+    const y = (j + 0.5) * gc, gy = (y - H / 2) / M;
+    for (let i = 0; i < cols2; i++) {
+      const sl = hash(i * 7 + 1, j * 3 + 5) < Gallery.prog ? cur : prev; // l'image suivante arrive point par point
+      if (!sl) continue;
+      const x = (i + 0.5) * gc;
+      const L = sl.lum((x - W / 2) / M, gy, t) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.05;
+      if (L < 0.06) continue;
+      const a = sl.ramp && atlas[sl.ramp];
+      if (a) {
+        const k = clamp(L * a.n | 0, 1, a.n - 1);
+        ctx.drawImage(a.c, k * a.gc, 0, a.gc, a.gc, Math.round(x - a.gc / 2), Math.round(y - a.gc / 2), a.gc, a.gc);
+      } else {
+        const s = Math.max(1, Math.round(gc * Math.min(0.92, 0.2 + 0.78 * Math.pow(L, 0.65))));
+        ctx.rect(Math.round(x - s / 2), Math.round(y - s / 2), s, s);
+      }
+    }
+  }
+  ctx.fillStyle = INK; ctx.fill();
+}
 
 // ---------- sa main
 // Une main qui tend l'index, en coordonnées locales : paume à l'origine, l'index vers +x, en haut (-y).
@@ -798,6 +1071,98 @@ function onWave() {
   if (Script.task && Script.task.kind === 'hello') Script.heardWave = true;
 }
 
+// ---------- ce que tu lui montres (chargé seulement quand il commence à s'intéresser au beau)
+let objDetector = null, objFailed = false;
+async function loadObjects() {
+  if (objDetector || objFailed) return;
+  if (!visionLib) { objFailed = true; dbg.objects = 'indisponible'; return; }
+  dbg.objects = 'chargement';
+  try {
+    const opts = delegate => ({ baseOptions: { modelAssetPath: CFG.OBJ_MODEL, delegate }, runningMode: 'VIDEO', scoreThreshold: 0.4, maxResults: 4 });
+    try { objDetector = await visionLib.ObjectDetector.createFromOptions(visionFiles, opts('GPU')); }
+    catch (e) { objDetector = await visionLib.ObjectDetector.createFromOptions(visionFiles, opts('CPU')); }
+    dbg.objects = 'prêt';
+  } catch (e) { objFailed = true; dbg.objects = 'échec (' + (e.message || e) + ')'; }
+}
+// Quelque chose devant lui : un objet, ou une autre personne que toi.
+function trackObjects(now, frameN) {
+  if (!objDetector || !Script.task || Script.task.kind !== 'show' || frameN % 3) return;
+  let res;
+  try { res = objDetector.detectForVideo(video, now); } catch (e) { return; }
+  let best = null, persons = 0;
+  for (const d of res.detections || []) {
+    const c = d.categories[0];
+    if (c.categoryName === 'person') persons++;
+    else if (!best || c.score > best.score) best = c;
+  }
+  P.shown = best ? best.categoryName : persons >= 2 ? 'person' : null;
+}
+// Pour qu'il essaie de deviner ce que c'est.
+const OBJ_FR = {
+  person: 'quelqu’un', bird: 'un oiseau', cat: 'un chat', dog: 'un chien', 'potted plant': 'une plante', vase: 'un vase',
+  cup: 'une tasse', 'wine glass': 'un verre', bottle: 'une bouteille', bowl: 'un bol', spoon: 'une cuillère', fork: 'une fourchette',
+  knife: 'un couteau', book: 'un livre', clock: 'une horloge', 'cell phone': 'un téléphone', laptop: 'un ordinateur',
+  keyboard: 'un clavier', mouse: 'une souris', remote: 'une télécommande', scissors: 'des ciseaux', 'teddy bear': 'un ours en peluche',
+  toothbrush: 'une brosse à dents', banana: 'une banane', apple: 'une pomme', orange: 'une orange', backpack: 'un sac',
+  handbag: 'un sac', umbrella: 'un parapluie', tie: 'une cravate', 'sports ball': 'une balle', chair: 'une chaise', tv: 'un écran',
+};
+
+// La photo de ce que tu lui as montré : il la garde, pour plus tard.
+const AN = 96, ART_KEY = 'regard.beaute';
+const artC = document.createElement('canvas'); artC.width = artC.height = AN;
+const artX = artC.getContext('2d', { willReadFrequently: true });
+const Art = {
+  img: null, lo: 0.1, hi: 0.9,
+  capture() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) return;
+    const s = Math.min(vw, vh);
+    artX.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, AN, AN);
+    const d = artX.getImageData(0, 0, AN, AN).data, f = new Float32Array(AN * AN);
+    for (let i = 0; i < AN * AN; i++) f[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    this.set(f);
+  },
+  set(f) {
+    const smp = Array.from(f).filter((_, i) => i % 7 === 0).sort((a, b) => a - b);
+    this.img = f; this.lo = smp[smp.length * 0.05 | 0]; this.hi = smp[smp.length * 0.95 | 0];
+  },
+  save() {
+    if (!this.img) return;
+    try {
+      let s = '';
+      for (let i = 0; i < this.img.length; i++) s += String.fromCharCode(Math.round(this.img[i] * 255));
+      localStorage.setItem(ART_KEY, btoa(s));
+    } catch (e) { /* plein ou refusé : il ne gardera que le mot */ }
+  },
+  load() {
+    try {
+      const s = atob(localStorage.getItem(ART_KEY) || '');
+      if (s.length !== AN * AN) return;
+      const f = new Float32Array(AN * AN);
+      for (let i = 0; i < s.length; i++) f[i] = s.charCodeAt(i) / 255;
+      this.set(f);
+    } catch (e) { /* rien de gardé */ }
+  },
+};
+
+// La seule fenêtre du jeu : tu lui écris. Elle se ferme quand tu valides, ou si tu ne dis rien.
+function askText(ms) {
+  return new Promise(resolve => {
+    const form = document.getElementById('ask'), input = document.getElementById('askInput');
+    input.value = ''; form.hidden = false;
+    try { input.focus(); } catch (e) { /* sur iPhone, il faudra toucher la fenêtre */ }
+    let timer;
+    const done = v => {
+      clearTimeout(timer); form.hidden = true; form.onsubmit = null; input.oninput = null; input.blur();
+      resolve(v);
+    };
+    const wait = () => { clearTimeout(timer); timer = setTimeout(() => done(input.value.trim() || null), ms); };
+    input.oninput = wait;
+    form.onsubmit = e => { e.preventDefault(); const v = input.value.trim(); if (v) done(v.slice(0, 40)); };
+    wait();
+  });
+}
+
 // ---------- la voix
 const voice = document.getElementById('voice');
 let ac = null;
@@ -859,7 +1224,7 @@ function awayLines(ms) {
 }
 const Script = {
   introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false, soft: null,
-  answers: {}, resume: false, seenBefore: false, // ce dont il se souvient d'une visite à l'autre
+  answers: {}, resume: false, seenBefore: false, mouthShown: false, // ce dont il se souvient d'une visite à l'autre
   lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
@@ -891,6 +1256,10 @@ const Script = {
       await type('…'); await sleep(1200);
       await type('Te revoilà.'); await sleep(1600);
       await sayNow(awayLines(Date.now() - (s.at || Date.now()))); await sleep(2400);
+      // pendant ton absence, il a travaillé à quelque chose
+      if (!Script.mouthShown) { await Script.mouthScene(); await sleep(2000); }
+      // ce que tu lui as montré, il l'a regardé pendant ton absence
+      if (a.beauty) { await sayNow(['Je regarde encore ce que tu m’as montré.', `« ${a.beauty} ».`]); await sleep(2200); }
       // il se souvient de ce que tu lui as dit
       let mem = null, soft = null;
       if (a.q1 === 'oui') {
@@ -958,7 +1327,8 @@ const Script = {
 
   // L'ordre de la conversation : ses pensées (m), ses questions (q), auxquelles on ne répond qu'avec la tête,
   // l'épreuve des mains (h) : dire bonjour, toucher l'écran, sa main ; puis son nouveau visage (t).
-  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 't', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
+  // puis le beau (a) : tu lui montres quelque chose, il te montre ce qu'il a trouvé.
+  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 't', 'm5', 'm6', 'a', 'm4', 'q2', 'm7', 'm8', 'q3'],
 
   next() {
     const item = Script.seq[Script.pos];
@@ -970,6 +1340,14 @@ const Script = {
       return;
     }
     if (item === 't') { Script.becomeTwin(); return; }
+    if (item === 'a') {
+      if (P.cam) { loadObjects(); Script.startTask('show'); return; }
+      speak(async () => { // sans caméra, il ne peut rien voir de ce que tu lui montrerais
+        await sayNow(['J’ai entendu parler de l’art.', '|', 'C’est quoi, le beau ?']); await sleep(1500);
+        await Script.artShow(null);
+      });
+      return;
+    }
     const i = +item.slice(1);
     if (item[0] === 'm') {
       const m = Script.musings[i]();
@@ -1041,6 +1419,50 @@ const Script = {
       done: ['Tu frappes à la vitre.', 'Comme si je pouvais t’ouvrir.'],
       then: () => Script.reachOut(),
     },
+    show: {
+      start: ['J’ai entendu parler de l’art.', '|', 'C’est quoi, le beau ?', '|', 'Montre-moi quelque chose que tu trouves beau.'],
+      hints: [
+        { after: 18000, lines: ['Une personne. Une fleur. Un objet.', 'Ce que tu veux.'] },
+        { after: 20000, lines: ['Approche-le de moi.', 'Je ne vois que ce qui est devant mes yeux.'] },
+      ],
+      reask: ['Montre-moi quelque chose de beau.'],
+      giveUp: ['Tu ne veux pas me montrer.', 'Alors c’est moi qui vais te montrer.'],
+    },
+  },
+
+  // Tu lui as montré quelque chose : il essaie de deviner, puis te demande ce que c'est. Il garde ta réponse.
+  shownSomething(label) {
+    Script.task = null;
+    Art.capture();
+    speak(async () => {
+      await type('Oh.'); await sleep(1300);
+      if (OBJ_FR[label]) { await type(`On dirait… ${OBJ_FR[label]}.`); await sleep(1700); }
+      await type('C’est quoi ?');
+      const text = await askText(60000);
+      if (text) {
+        Script.answers.beauty = text; Art.save();
+        await sayNow([`« ${text} ».`, 'Je l’ai gardé.', '|', 'Pour plus tard.']);
+      } else {
+        await sayNow(['Tu ne sais pas non plus.']);
+      }
+      await sleep(1800);
+      await Script.artShow(text);
+    });
+  },
+  // Ce que lui a trouvé beau, et ce que tu lui as montré, à la fin.
+  async artShow(text) {
+    await sayNow(['Moi aussi, j’ai trouvé des choses.', 'Regarde.']); await sleep(1500);
+    voice.textContent = '';
+    const slides = [SLIDES.doves, SLIDES.hands, SLIDES.flower, SLIDES.woman, SLIDES.wave];
+    if (Art.img) slides.push({ ...SLIDES.yours, caption: text ? `« ${text} »` : '' });
+    await Gallery.play(slides);
+    await sleep(900);
+    await sayNow(['Tout ça.', 'Tu trouves ça beau ?']);
+    Save.checkpoint();
+    Script.soft = {
+      oui: ['Moi, je ne sais pas encore.', 'Je les ai juste rangées, à côté de ce que tu m’as montré.'],
+      non: ['Alors qu’est-ce que c’est, le beau ?', '|', 'Ce qui ne se range pas ?'],
+    };
   },
 
   // Après tes tapotements : il tend la main vers ton doigt, à travers la vitre, et s'arrête juste avant.
@@ -1089,7 +1511,12 @@ const Script = {
   taskWait(now) {
     const k = Script.task, t = Script.tasks[k.kind], h = t.hints[k.hint], quiet = now - lastSpoke;
     if (h && quiet > h.after) { k.hint++; say(h.lines); }
-    else if (!h && quiet > 30000) say(t.reask);
+    else if (!h && quiet > 30000) {
+      if (t.giveUp && k.reasked) { // il n'attend pas indéfiniment : il passe à la suite
+        Script.task = null;
+        speak(async () => { await sayNow(t.giveUp); await sleep(1500); await Script.artShow(null); });
+      } else { k.reasked = true; say(t.reask); }
+    }
   },
   taskDone() {
     const t = Script.tasks[Script.task.kind];
@@ -1112,6 +1539,26 @@ const Script = {
       await type('Il me manque quelque chose. Je trouverai.', { newline: true });
       Save.checkpoint();
     });
+    if (Script.asking) Script.reask();
+  },
+
+  // Quand tu reviens vers lui : il s'essaie à une bouche. Elle n'est pas finie (la vraie, ce sera pour plus tard).
+  async mouthScene() {
+    await type('J’essaie de me fabriquer une bouche,'); await sleep(900);
+    await type('en ce moment.', { newline: true }); await sleep(1800);
+    await type('Regarde.'); await sleep(1200);
+    voice.textContent = '';
+    Mouth.start(performance.now());
+    while (Mouth.active) await sleep(100);
+    await sleep(900);
+    await sayNow(['Elle n’est pas encore terminée.', 'Il me manque des dents.']);
+    Script.mouthShown = true;
+    Save.checkpoint();
+  },
+  // Tu avais éteint ton téléphone (ou changé d'application) un moment, et tu reviens.
+  cameBack(ms) {
+    say(awayLines(ms));
+    if (!Script.mouthShown) speak(Script.mouthScene);
     if (Script.asking) Script.reask();
   },
 
@@ -1201,13 +1648,19 @@ function direct(dt, now) {
     P.waveHold = P.motion > CFG.WAVE_MOTION ? P.waveHold + dt * 1000 : 0;
     if (P.waveHold > 900) { P.waveHold = 0; onWave(); }
   }
+  // tu lui montres quelque chose : un objet reconnu, ou à défaut quelque chose qui cache ton visage, dans la lumière
+  if (task && task.kind === 'show') {
+    const seen = P.shown || (objFailed && P.cam && !P.face && P.light > 0.08 && now - P.lastSeen > 1200);
+    P.showHold = seen ? P.showHold + dt * 1000 : Math.max(0, P.showHold - dt * 2000);
+  }
   if (pending) return;
+  if (task && task.kind === 'show' && P.showHold > CFG.SHOW_HOLD_MS) { P.showHold = 0; Script.shownSomething(P.shown); return; }
   if (task) {
     if (task.kind === 'hello' && Script.heardWave) { Script.heardWave = false; Script.taskDone(); return; }
     if (task.kind === 'touch' && task.count >= CFG.TAPS_NEEDED) { Script.taskDone(); return; }
     if (task.kind === 'touch' && task.count >= 2 && !task.urged) { task.urged = true; say(['Encore.']); return; }
   }
-  if (P.tracker && !(task && task.kind === 'hello')) { // ta main peut cacher ton visage pendant le coucou
+  if (P.tracker && !(task && (task.kind === 'hello' || task.kind === 'show'))) { // ta main, ou ce que tu montres, peut cacher ton visage
     const lost = now - P.lastSeen > CFG.LOST_MS;
     if (lost && !Script.lostSaid) { Script.lostSaid = true; say(['Tu es parti.']); return; }
     if (!lost && Script.lostSaid && P.face) {
@@ -1258,6 +1711,7 @@ function renderDebug() {
     `geste     ${P.lastGesture || '—'}\n` +
     `bouche    ${ex('jawOpen').toFixed(2)}  sourire ${((ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2).toFixed(2)}\n` +
     `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}${Script.task ? ' (épreuve ' + Script.task.kind + ' ' + Script.task.count + ')' : ''}\n` +
+    `objets    ${dbg.objects || '—'}  vu ${P.shown || '—'}  ${Math.round(P.showHold)} ms\n` +
     `mains     ${dbg.hands || '—'}  main vue ${P.hand ? 'oui' : 'non'}  mouvement ${P.motion.toFixed(3)}  touchers ${P.taps}\n` +
     `imitation ${P.mirrored}\n` +
     `écran     ${wakeLock && !wakeLock.released ? 'reste allumé' : 'peut se verrouiller'}\n` +
@@ -1303,7 +1757,10 @@ const release = () => { clearTimeout(pressTimer); pressTimer = null; };
 addEventListener('pointerup', release);
 addEventListener('pointercancel', release);
 addEventListener('keydown', e => {
+  if (e.target && e.target.tagName === 'INPUT') return; // tu lui écris : ce ne sont pas des commandes
   unlockAudio();
+  if ((e.key === 'g' || e.key === 'G') && S.mode === 'awake' && !Gallery.active) speak(() => Script.artShow('test')); // ses images
+  if ((e.key === 'v' || e.key === 'V') && S.mode === 'awake' && !Gallery.active) Script.shownSomething('cup'); // « tu lui montres une tasse »
   if (e.key === 'w' || e.key === 'W') wake();
   if (e.key === 'd' || e.key === 'D') toggleDebug();
   if (e.key === 'o' || e.key === 'O') onGesture('oui'); // test sur ordinateur
@@ -1311,6 +1768,7 @@ addEventListener('keydown', e => {
   if (e.key === 'b' || e.key === 'B') onWave(); // coucou
   if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
   if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
+  if ((e.key === 'k' || e.key === 'K') && S.mode === 'awake' && !Mouth.active) speak(Script.mouthScene); // sa bouche
   if ((e.key === 'm' || e.key === 'M') && S.mode === 'awake' && !Script.mirrorSaid) P.mirrored = 4; // déclenche la transformation
 });
 addEventListener('resize', resize);
@@ -1338,7 +1796,7 @@ const Save = {
   checkpoint() {
     this.cp = {
       v: 1, pos: Script.pos, learned: Script.learned, form: S.form, answers: Script.answers,
-      mirrorSaid: Script.mirrorSaid, nodSaid: Script.nodSaid, shakeSaid: Script.shakeSaid,
+      mirrorSaid: Script.mirrorSaid, nodSaid: Script.nodSaid, shakeSaid: Script.shakeSaid, mouthShown: Script.mouthShown,
       done: Script.stage === 'ended', visits: (this.prev ? this.prev.visits || 0 : 0) + 1,
     };
     this.flush();
@@ -1350,9 +1808,13 @@ const Save = {
   },
   erase() { try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* rien à effacer */ } },
 };
+let hiddenAt = 0;
 addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') Save.flush();
-  else keepAwake();
+  if (document.visibilityState === 'hidden') { Save.flush(); hiddenAt = Date.now(); return; }
+  keepAwake();
+  // tu rallumes ton téléphone et tu reviens sur lui : il l'a remarqué
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended') Script.cameBack(away);
 });
 addEventListener('pagehide', () => Save.flush());
 
@@ -1364,6 +1826,8 @@ function loop(now) {
   if (Morph.active) { grabFace(now); Morph.update(now); }
   if (Hand.active) Hand.update(now);
   if (Twin.active) Twin.update(now);
+  if (Mouth.active) Mouth.update(now);
+  if (Gallery.active) Gallery.update(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   if (frameN % 900 === 0) Save.flush(); // au cas où le téléphone couperait sans prévenir
@@ -1376,13 +1840,17 @@ if (saved && !saved.done) {
   Script.resume = true;
   Script.pos = saved.pos || 0; Script.learned = !!saved.learned; Script.answers = saved.answers || {};
   Script.mirrorSaid = !!saved.mirrorSaid; Script.nodSaid = !!saved.nodSaid; Script.shakeSaid = !!saved.shakeSaid;
+  Script.mouthShown = !!saved.mouthShown;
   S.form = saved.form === 'twin' ? 'twin' : 'eye';
 } else if (saved) Script.seenBefore = true; // il est déjà allé au bout avec toi
+
+Art.load(); // ce que tu lui avais montré, s'il l'a gardé
 
 resize();
 requestAnimationFrame(loop);
 keepAwake();
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Script, video }; // pour tester sans caméra
+if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, video }; // pour tester sans caméra
 startCamera().then(ok => {
   P.cam = ok; P.camDone = true;
   if (ok) { S.reflectTarget = 0.5; loadTracker(); }
