@@ -57,11 +57,12 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
 const CFG = {
   // Proximité = écart entre les coins externes des yeux / petit côté de l'image. Elle varie d'un téléphone
   // à l'autre : on mesure d'abord ta distance habituelle, puis il faut venir nettement plus près.
-  WAKE_RATIO: 1.6,      // ~40 % plus près que ta distance habituelle
-  WAKE_MIN: 0.33,       // et jamais sous ce seuil absolu
-  WAKE_HOLD_MS: 900,    // temps à soutenir le regard de près avant le réveil
-  LENS_RATIO: 0.85,     // visage perdu juste après avoir presque atteint le seuil = un œil collé à l'objectif
-  LENS_WINDOW_MS: 2500,
+  WAKE_RATIO: 2.0,      // deux fois plus près que ta distance habituelle
+  WAKE_MIN: 0.42,       // et jamais sous ce seuil absolu (~15 cm)
+  WAKE_HOLD_MS: 1800,   // temps à soutenir le regard de près avant le réveil
+  LENS_RATIO: 0.95,     // visage perdu juste après avoir atteint le seuil…
+  LENS_BLUR: 0.55,      // …et image devenue floue (netteté < 55 % de l'habituelle) = un œil collé à l'objectif
+  LENS_WINDOW_MS: 4000,
   BASE_SAMPLES: 40,     // images utilisées pour mesurer ta distance habituelle
   TOO_CLOSE: 0.62,
   LOST_MS: 2600,        // absence du visage avant que l'œil le remarque
@@ -107,7 +108,7 @@ const P = {
   cam: false, tracker: false, face: false,
   close: 0, cx: 0.5, cy: 0.5, blink: false,
   lastSeen: 0, light: 0.4, hold: 0, pointer: null, mirrored: 0,
-  lostClose: 0, lostAt: 0, base: 0, baseN: 0,
+  lostClose: 0, lostAt: 0, base: 0, baseN: 0, sharp: 0, sharpBase: 0,
   camDone: false, trackerFailed: false,
 };
 const wakeAt = () => Math.max(CFG.WAKE_MIN, P.base * CFG.WAKE_RATIO);
@@ -145,6 +146,13 @@ function grabCam() {
     camL[i] = l; sum += l;
   }
   P.light = mix(P.light, sum / 1600, 0.1);
+  // netteté de l'image : elle s'effondre quand un œil est collé à l'objectif (flou, plein cadre)
+  let g = 0;
+  for (let y = 0; y < 39; y++) for (let x = 0; x < 39; x++) {
+    const i = y * 40 + x;
+    g += Math.abs(camL[i + 1] - camL[i]) + Math.abs(camL[i + 40] - camL[i]);
+  }
+  P.sharp = mix(P.sharp, g / 1521, 0.2);
 }
 const camAt = (x, y) => camL[clamp(y * 40 | 0, 0, 39) * 40 + clamp(x * 40 | 0, 0, 39)];
 
@@ -304,7 +312,8 @@ function checkWake(dt, now) {
   const centered = Math.abs(P.cx - 0.5) < 0.28 && Math.abs(P.cy - 0.5) < 0.32;
   const ready = P.baseN >= CFG.BASE_SAMPLES; // rien tant qu'on ne connaît pas ta distance habituelle
   const near = ready && P.face && P.close > wakeAt() && centered && !P.blink;
-  const onLens = ready && !P.face && P.lostClose > wakeAt() * CFG.LENS_RATIO && now - P.lostAt < CFG.LENS_WINDOW_MS;
+  const blurry = P.sharpBase > 0 && P.sharp < P.sharpBase * CFG.LENS_BLUR;
+  const onLens = ready && blurry && !P.face && P.lostClose > wakeAt() * CFG.LENS_RATIO && now - P.lostAt < CFG.LENS_WINDOW_MS;
   if (near || onLens) P.hold += dt * 1000;
   else P.hold = Math.max(0, P.hold - dt * 1500);
   if (P.hold > CFG.WAKE_HOLD_MS) wake();
@@ -348,6 +357,7 @@ function track(now, frameN) {
   // ta distance habituelle : moyenne des premières images, puis suivie lentement, jamais pendant une approche
   if (P.baseN < CFG.BASE_SAMPLES) { P.base = (P.base * P.baseN + P.close) / (P.baseN + 1); P.baseN++; }
   else if (P.close < P.base * 1.25) P.base = mix(P.base, P.close, 0.01);
+  if (P.close < P.base * 1.25 && P.sharp > 0) P.sharpBase = P.sharpBase ? mix(P.sharpBase, P.sharp, 0.02) : P.sharp;
   P.cx = (ax + bx) / 2 / vw; P.cy = (ay + by) / 2 / vh;
   const bs = res.faceBlendshapes && res.faceBlendshapes[0];
   if (bs) {
@@ -513,7 +523,8 @@ function renderDebug() {
     `habituel  ${P.base.toFixed(3)} (${Math.min(P.baseN, CFG.BASE_SAMPLES)}/${CFG.BASE_SAMPLES})\n` +
     `proximité ${P.close.toFixed(3)} / seuil ${wakeAt().toFixed(3)}\n` +
     `perdu à   ${P.lostClose.toFixed(3)} (objectif si > ${(wakeAt() * CFG.LENS_RATIO).toFixed(3)})\n` +
-    `maintien  ${Math.round(P.hold)} ms\n` +
+    `netteté   ${P.sharp.toFixed(3)} / habituelle ${P.sharpBase.toFixed(3)} (flou si < ${(P.sharpBase * CFG.LENS_BLUR).toFixed(3)})\n` +
+    `maintien  ${Math.round(P.hold)} / ${CFG.WAKE_HOLD_MS} ms\n` +
     `lumière   ${P.light.toFixed(2)}\n` +
     `imitation ${P.mirrored}`;
 }
