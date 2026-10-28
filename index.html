@@ -271,6 +271,9 @@ function update(dt, now) {
     const fx = P.face ? clamp((0.5 - P.cx) * 1.5, -0.45, 0.45) : 0;
     const fy = P.face ? clamp((P.cy - 0.45) * 0.9, -0.13, 0.15) : 0;
     S.px += (fx + S.jx - S.px) * k(3); S.py += (fy + S.jy - S.py) * k(3);
+    // seul indice : ton reflet, à peine visible, qui se précise à mesure que tu t'approches
+    const near = P.face && P.baseN >= CFG.BASE_SAMPLES ? clamp((P.close - P.base) / (wakeAt() - P.base), 0, 1) : 0;
+    if (P.cam) S.reflectTarget = 0.45 + 0.5 * near;
     return;
   }
 
