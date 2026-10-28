@@ -57,6 +57,8 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
 const CFG = {
   WAKE_CLOSENESS: 0.30, // écart coins externes des yeux / petit côté de l'image : ~0.20 à bout de bras, ~0.30 vers 20 cm
   WAKE_HOLD_MS: 900,    // temps à soutenir le regard de près avant le réveil
+  LENS_CLOSE: 0.26,     // visage perdu juste après cette proximité = un œil collé à l'objectif
+  LENS_WINDOW_MS: 2500,
   TOO_CLOSE: 0.62,
   LOST_MS: 2600,        // absence du visage avant que l'œil le remarque
   SILENCE_MS: 7500,     // silence avant que l'œil reprenne la parole
@@ -101,6 +103,7 @@ const P = {
   cam: false, tracker: false, face: false,
   close: 0, cx: 0.5, cy: 0.5, blink: false,
   lastSeen: 0, light: 0.4, hold: 0, pointer: null, mirrored: 0,
+  lostClose: 0, lostAt: 0,
 };
 const dbg = { cam: '…', tracker: '—' };
 
@@ -252,13 +255,16 @@ function update(dt, now) {
 
   if (S.mode === 'boot') return;
   if (S.mode === 'asleep') {
-    // il vit déjà, mais ne te voit pas encore : clignements lents, regard qui flotte à côté de toi
+    // il ne parle pas encore, mais il te suit déjà des yeux : lentement, avec un temps de retard
     if (now > S.nextBlink) { blink(); S.nextBlink = now + 3500 + rand() * 6000; }
     if (now > S.nextSaccade) {
-      S.jx = (rand() - 0.5) * 0.22; S.jy = 0.03 + (rand() - 0.5) * 0.08;
+      const a = P.face ? 0.05 : 0.22;
+      S.jx = (rand() - 0.5) * a; S.jy = (P.face ? 0 : 0.03) + (rand() - 0.5) * a * 0.4;
       S.nextSaccade = now + 1400 + rand() * 3200;
     }
-    S.px += (S.jx - S.px) * k(4); S.py += (S.jy - S.py) * k(4);
+    const fx = P.face ? clamp((0.5 - P.cx) * 1.5, -0.45, 0.45) : 0;
+    const fy = P.face ? clamp((P.cy - 0.45) * 0.9, -0.13, 0.15) : 0;
+    S.px += (fx + S.jx - S.px) * k(3); S.py += (fy + S.jy - S.py) * k(3);
     return;
   }
 
@@ -283,10 +289,13 @@ function update(dt, now) {
   if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
 }
 
-function checkWake(dt) {
+// Il ne parle qu'une fois ton œil approché de la caméra frontale ; sinon il ne fait que te regarder.
+function checkWake(dt, now) {
   if (S.mode !== 'asleep') return;
   const centered = Math.abs(P.cx - 0.5) < 0.28 && Math.abs(P.cy - 0.5) < 0.32;
-  if (P.face && P.close > CFG.WAKE_CLOSENESS && centered && !P.blink) P.hold += dt * 1000;
+  const near = P.face && P.close > CFG.WAKE_CLOSENESS && centered && !P.blink;
+  const onLens = !P.face && P.lostClose > CFG.LENS_CLOSE && now - P.lostAt < CFG.LENS_WINDOW_MS;
+  if (near || onLens) P.hold += dt * 1000;
   else P.hold = Math.max(0, P.hold - dt * 1500);
   if (P.hold > CFG.WAKE_HOLD_MS) wake();
 }
@@ -318,7 +327,10 @@ function track(now, frameN) {
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   const lm = res.faceLandmarks && res.faceLandmarks[0];
-  if (!lm) { P.face = false; return; }
+  if (!lm) {
+    if (P.face) { P.lostClose = P.close; P.lostAt = now; }
+    P.face = false; return;
+  }
   const vw = video.videoWidth, vh = video.videoHeight, m = Math.min(vw, vh);
   const ax = lm[33].x * vw, ay = lm[33].y * vh, bx = lm[263].x * vw, by = lm[263].y * vh;
   P.face = true; P.lastSeen = now;
@@ -485,6 +497,7 @@ function renderDebug() {
     `suivi     ${dbg.tracker}\n` +
     `visage    ${P.face ? 'oui' : 'non'}\n` +
     `proximité ${P.close.toFixed(3)} / seuil ${CFG.WAKE_CLOSENESS}\n` +
+    `perdu à   ${P.lostClose.toFixed(3)} (objectif si > ${CFG.LENS_CLOSE})\n` +
     `maintien  ${Math.round(P.hold)} ms\n` +
     `lumière   ${P.light.toFixed(2)}\n` +
     `imitation ${P.mirrored}`;
@@ -516,7 +529,7 @@ addEventListener('resize', resize);
 let last = performance.now(), frameN = 0;
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now; frameN++;
-  track(now, frameN); checkWake(dt); update(dt, now); direct(now); draw();
+  track(now, frameN); checkWake(dt, now); update(dt, now); direct(now); draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   requestAnimationFrame(loop);
 }
