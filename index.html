@@ -724,100 +724,69 @@ const Twin = {
 };
 
 // ---------- ce qu'il trouve beau
-// Des images qui bougent, recréées dans sa trame : colombes, la Création d'Adam (Michel-Ange), une fleur,
-// une femme, la Grande Vague (Hokusai), puis ce que tu lui as montré. Coordonnées : unités du petit côté de l'écran,
-// centrées. Certaines en points, d'autres en caractères.
-function dove(gx, gy, bx, by, s, ph, dir) {
-  const lx = (gx - bx) / s * dir, ly = (gy - by) / s;
-  if (Math.abs(lx) > 1 || Math.abs(ly) > 1) return 0;
-  const tip = -0.62 * Math.sin(ph);                                     // le battement d'ailes
-  let d = Math.hypot(lx / 0.34, ly / 0.12) * 0.12 - 0.12;                // corps
-  d = Math.min(d, Math.hypot(lx - 0.33, ly + 0.07) - 0.075);             // tête
-  d = Math.min(d, cap(lx, ly, -0.25, 0.01, -0.55, 0.07, 0.06, 0.11));    // queue
-  for (const f of [-0.13, 0, 0.13]) {                                    // deux ailes, en éventail de plumes
-    d = Math.min(d, cap(lx, ly, 0.06, -0.04, 0.24 + f, tip + Math.abs(f) * 0.6, 0.11, 0.025));
-    d = Math.min(d, cap(lx, ly, -0.06, -0.04, -0.16 + f, tip * 0.92 - 0.04 + Math.abs(f) * 0.5, 0.1, 0.025));
-  }
-  d += (noise(lx * 18 + bx * 9, ly * 18) - 0.5) * 0.06;                  // plumes
-  return smooth(0.02, -0.06, d) * 0.95 + 0.35 * Math.exp(-Math.max(d, 0) / 0.08); // et leur lueur
+// Les images viennent de Wikimedia Commons (domaine public ou CC0, voir art/CREDITS.md), réduites en niveaux de gris.
+const PICS = {};
+function loadPic(name) {
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    const d = g.getImageData(0, 0, c.width, c.height).data, f = new Float32Array(c.width * c.height);
+    for (let i = 0; i < f.length; i++) f[i] = d[i * 4] / 255;
+    PICS[name] = { f, w: c.width, h: c.height };
+  };
+  img.src = 'art/' + name + '.png';
 }
-function handAt(gx, gy, tx, ty, ang, hs) {
-  const dx = gx - tx, dy = gy - ty, c = Math.cos(ang), s = Math.sin(ang), flip = c < 0 ? -1 : 1;
-  const lx = (dx * c + dy * s) / hs + 1.6, ly = (-dx * s + dy * c) / hs * flip - 0.215;
-  if (lx < -3.2 || lx > 1.9 || Math.abs(ly) > 0.75) return 0;
-  const d = handSDF(lx, ly);
-  if (d > 0.02) return 0;
-  return smooth(0.02, -0.14, d) * (0.5 + 0.5 * clamp(0.45 - ly * 1.2, 0, 1)) * (0.75 + 0.25 * noise(lx * 9, ly * 9)) * 0.95;
+// la valeur de l'image en (u, v), entre 0 et 1, lissée entre ses pixels
+function pic(name, u, v) {
+  const p = PICS[name];
+  if (!p || u < 0 || u >= 1 || v < 0 || v >= 1) return 0;
+  const x = u * (p.w - 1), y = v * (p.h - 1), x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
+  const i = y0 * p.w + x0, dx = x0 < p.w - 1 ? 1 : 0, dy = y0 < p.h - 1 ? p.w : 0;
+  return mix(mix(p.f[i], p.f[i + dx], fx), mix(p.f[i + dy], p.f[i + dy + dx], fx), fy);
 }
+// coordonnées de l'image posée au centre, large de `wu`
+const fit = (name, gx, gy, wu) => {
+  const p = PICS[name];
+  return p ? [gx / wu + 0.5, gy / (wu * p.h / p.w) + 0.5] : [-1, -1];
+};
 const SLIDES = {
-  doves: { fine: true, lum(gx, gy, t) {
-    let L = 0;
-    for (const [bx, by, s, p, dir] of [[-0.18, -0.45, 0.3, 0, 1], [0.16, -0.12, 0.34, 1.7, -1], [-0.06, 0.25, 0.32, 3.1, 1], [0.18, 0.58, 0.28, 4.4, -1]]) {
-      L = Math.max(L, dove(gx, gy, bx + 0.03 * Math.sin(t * 0.5 + p) + t * 0.012 * dir, by - t * 0.02, s, t * 7 + p, dir));
-    }
-    return L;
+  doves: { fine: true, lum(gx, gy, t) { // elles montent lentement, leurs ailes ondulent, elles brillent
+    let [u, v] = fit('doves', gx, gy, 0.95);
+    v += 0.06 - t * 0.004 + 0.004 * Math.sin(u * 22 + t * 6);
+    u += 0.006 * Math.sin(t * 0.5 + v * 3);
+    const c = pic('doves', u, v);
+    const glow = (pic('doves', u + 0.012, v) + pic('doves', u - 0.012, v) + pic('doves', u, v + 0.012) + pic('doves', u, v - 0.012)) / 4;
+    return Math.min(1, Math.pow(c, 0.8) + 0.45 * glow);
   } },
-  hands: { fine: true, lum(gx, gy, t) { // elles s'approchent, sans jamais se toucher
-    const gap = 0.05 + 0.025 * Math.sin(t * 0.8);
-    return Math.max(handAt(gx, gy, gap / 2, 0.0, Math.PI + 0.06, 0.2), handAt(gx, gy, -gap / 2, 0.05, 0.12, 0.2));
+  hands: { fine: true, lum(gx, gy, t) { // la Création d'Adam : elles s'approchent, sans jamais se toucher
+    let [u, v] = fit('hands', gx, gy, 1.15);
+    const d = 0.012 + 0.01 * Math.sin(t * 0.8);
+    u += u < 0.475 ? -d : d;
+    return pic('hands', u, v);
   } },
-  flower: { ramp: 'fine', lum(gx, gy, t) {
-    const fx = 0.02 + 0.015 * Math.sin(t * 0.6), fy = -0.22;
-    let L = 0;
-    const sy = clamp((gy - fy) / 0.9, 0, 1);                                    // la tige
-    if (gy > fy && gy < fy + 0.95) L = 0.55 * smooth(0.024, 0.008, Math.abs(gx - fx - 0.12 * sy * sy));
-    const dx = gx - fx, dy = gy - fy, r = Math.hypot(dx, dy), a = Math.atan2(dy, dx);
-    const breathe = 1 + 0.04 * Math.sin(t * 1.3);
-    for (let k = 0; k < 6; k++) {                                              // six pétales qui respirent
-      const pa = k * Math.PI / 3 + 0.3 + 0.04 * Math.sin(t * 0.7 + k);
-      const da = Math.atan2(Math.sin(a - pa), Math.cos(a - pa));
-      const along = r * Math.cos(da), across = r * Math.sin(da), len = 0.36 * breathe * (k % 2 ? 0.9 : 1);
-      if (along <= 0 || along >= len) continue;
-      const w = 0.1 * Math.pow(Math.sin(along / len * Math.PI), 0.8);
-      if (Math.abs(across) < w) L = Math.max(L, 0.2 + (0.45 + 0.35 * (1 - along / len) + 0.12 * Math.sin(across * 90)) * smooth(w, w * 0.6, Math.abs(across)));
-    }
-    return clamp(Math.max(L, 0.9 * smooth(0.045, 0.02, r)), 0, 1);             // le cœur
+  flower: { ramp: 'fine', lum(gx, gy, t) { // le lys respire et se balance
+    const a = 0.03 * Math.sin(t * 0.6), s = 1 + 0.03 * Math.sin(t * 0.5);
+    const x = (gx * Math.cos(a) - gy * Math.sin(a)) / s, y = (gx * Math.sin(a) + gy * Math.cos(a)) / s;
+    const [u, v] = fit('lily', x, y, 0.95);
+    return Math.min(1, pic('lily', u, v) * 1.35);
   } },
-  woman: { ramp: 'body', lum(gx, gy, t) {
-    const x = gx - 0.012 * Math.sin(t * 0.8) * (0.6 - gy), y = gy;              // elle se balance à peine
-    let d = Math.hypot(x, y + 0.7) - 0.07;                                      // tête
-    d = Math.min(d, Math.hypot((x + 0.015) / 1.1, y + 0.72) - 0.085);          // cheveux
-    d = smin(d, cap(x, y, 0, -0.63, 0, -0.56, 0.028, 0.032), 0.02);            // cou
-    d = smin(d, cap(x, y, 0, -0.54, 0, -0.18, 0.1, 0.075), 0.04);              // buste
-    d = smin(d, Math.hypot(x / 0.12, (y + 0.08) / 0.09) * 0.09 - 0.09, 0.04);   // hanches
-    d = Math.min(d, cap(x, y, 0.085, -0.5, 0.17, -0.66, 0.032, 0.028));         // bras levé
-    d = Math.min(d, cap(x, y, 0.17, -0.66, 0.05, -0.79, 0.026, 0.022));         // main sur la tête
-    d = Math.min(d, cap(x, y, -0.09, -0.5, -0.12, -0.3, 0.03, 0.026));          // l'autre bras
-    d = Math.min(d, cap(x, y, -0.12, -0.3, -0.1, -0.1, 0.026, 0.02));
-    d = smin(d, cap(x, y, -0.05, -0.04, -0.055, 0.4, 0.055, 0.04), 0.03);       // jambes
-    d = Math.min(d, cap(x, y, -0.055, 0.4, -0.06, 0.82, 0.04, 0.028));
-    d = smin(d, cap(x, y, 0.05, -0.04, 0.065, 0.4, 0.055, 0.04), 0.03);
-    d = Math.min(d, cap(x, y, 0.065, 0.4, 0.06, 0.82, 0.04, 0.028));
-    if (d > 0.01) return 0;
-    return clamp(0.3 + 0.55 * smooth(-0.06, 0.09, x) + 0.15 * noise(x * 30, y * 30), 0, 1) * smooth(0.01, -0.03, d);
+  woman: { ramp: 'body', lum(gx, gy, t) { // Vénus (Botticelli), qui oscille à peine
+    let [u, v] = fit('venus', gx, gy, 0.6);
+    u += 0.008 * Math.sin(t * 0.8) * (0.5 - v);
+    return Math.min(1, pic('venus', u, v) * 1.1);
   } },
-  wave: { ramp: 'wave', lum(gx, gy, t) {
-    const bw = 0.47, bh = 0.3, ax = Math.abs(gx), ay = Math.abs(gy);
-    if ((Math.abs(ax - bw) < 0.007 && ay < bh) || (Math.abs(ay - bh) < 0.007 && ax < bw)) {  // le cadre, en pointillés
+  wave: { ramp: 'wave', lum(gx, gy, t) { // la Grande Vague (Hokusai), dans un cadre en pointillés ; l'eau bouge
+    const bw = 0.47, bh = bw * 100 / 150, ax = Math.abs(gx), ay = Math.abs(gy);
+    if ((Math.abs(ax - bw) < 0.008 && ay < bh) || (Math.abs(ay - bh) < 0.008 && ax < bw)) {
       return Math.floor((gx + gy) * 70) % 2 ? 0.3 : 0;
     }
-    if (ax > bw - 0.015 || ay > bh - 0.015) return 0;
-    const x = gx / bw, y = gy / bh, drift = 0.04 * Math.sin(t * 0.45);
-    const crest = 0.55 - 1.25 * Math.exp(-(((x + 0.35 - drift) / 0.42) ** 2));          // la grande vague
-    const small = 0.5 - 0.45 * Math.exp(-(((x - 0.55) / 0.18) ** 2)) + 0.03 * Math.sin(t * 1.2);
-    const sea = 0.5 + 0.06 * Math.sin(x * 7 + t * 1.6) + 0.04 * Math.sin(x * 13 - t * 2.1);
-    const surface = Math.min(crest, small, sea);
-    let L = 0.5;                                                                         // le ciel
-    if (y > 0.12 && y < 0.5 && Math.abs(x - 0.18) < (y - 0.12) * 0.9) L = y < 0.2 ? 0.95 : 0.2; // le Fuji, au loin
-    if (y > surface) L = y - surface < 0.07 ? 0.95 : 0.22 + 0.2 * Math.max(0, Math.sin(x * 22 + y * 9 + t * 2));
-    // la lèvre qui s'enroule, et l'écume en griffes au bout
-    const lx = x + 0.1 - drift, ly = y + 0.55, rr = Math.hypot(lx, ly), an = Math.atan2(ly, lx);
-    if (an > -2.6 && an < 0.5 && Math.abs(rr - 0.32) < 0.07 && y < 0.25) L = 0.95;
-    for (let k = 0; k < 5; k++) {
-      const ca = 0.5 + k * 0.25, cx2 = 0.32 * Math.cos(ca) - 0.1 + drift, cy2 = 0.32 * Math.sin(ca) - 0.55;
-      if (Math.hypot(x - cx2, y - cy2) < 0.05 + 0.015 * Math.sin(t * 3 + k)) L = 0.95;
-    }
-    return L;
+    if (ax > bw - 0.012 || ay > bh - 0.012) return 0;
+    let u = gx / (2 * bw) + 0.5;
+    const v = gy / (2 * bh) + 0.5;
+    u += 0.006 * Math.sin(v * 25 + t * 2) * smooth(0.3, 0.6, v);
+    return pic('wave', u, v);
   } },
   yours: { fine: true, lum(gx, gy) { // ce que tu lui as montré, comme dans un miroir
     if (!Art.img) return 0;
@@ -1916,12 +1885,13 @@ if (saved && !saved.done) {
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
 MouthImg.load(); // ta bouche, s'il l'a prise
+['doves', 'hands', 'lily', 'venus', 'wave'].forEach(loadPic); // ce que lui trouve beau
 
 resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, video }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, video }; // pour tester sans caméra
 startCamera().then(ok => {
   P.cam = ok; P.camDone = true;
   if (ok) { S.reflectTarget = 0.5; loadTracker(); }
