@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Premier Regard</title>
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=VT323&display=swap">
+<style>
+/* Une seule scène plein écran : la trame de l'œil (canvas), sa voix en dessous. Aucun ATH. */
+:root{
+  --void:#000;
+  --ink:#d8d8d2;          /* points de la trame */
+  --voice:#f0f0ea;        /* texte de l'œil */
+  --dim:#6b6b66;          /* panneau debug */
+  --font-voice:"VT323", ui-monospace, "Courier New", monospace;
+  --font-debug:ui-monospace, Menlo, Consolas, monospace;
+  color-scheme:dark;
+}
+html,body{height:100%;margin:0;background:var(--void);overflow:hidden;overscroll-behavior:none}
+body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+#eye{position:fixed;inset:0;width:100%;height:100%;display:block}
+#cam{position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none}
+#voice{
+  position:fixed;left:0;right:0;bottom:calc(env(safe-area-inset-bottom,0px) + 12vh);margin:0;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));
+  font-family:var(--font-voice);font-size:clamp(22px,6.4vw,36px);line-height:1.12;letter-spacing:.06em;
+  color:var(--voice);text-transform:uppercase;text-align:center;text-wrap:balance;pointer-events:none;
+}
+#voice .cursor{display:inline-block;width:.5em;height:.86em;margin-left:.12em;vertical-align:-.06em;background:var(--voice);animation:blink 1.06s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+#debug{
+  position:fixed;margin:0;top:calc(env(safe-area-inset-top,0px) + 8px);left:max(12px,env(safe-area-inset-left,0px));
+  font:12px/1.4 var(--font-debug);color:var(--dim);white-space:pre;pointer-events:none;
+}
+@media (prefers-reduced-motion:reduce){#voice .cursor{animation:none}}
+</style>
+</head>
+<body>
+<canvas id="eye" aria-label="Un œil, immobile"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+<p id="voice" aria-live="polite"></p>
+<pre id="debug" hidden></pre>
+
+<script>
+(() => {
+'use strict';
+
+// Réglages. Le panneau debug (triple-tap en haut à gauche, ou touche D) affiche les valeurs mesurées.
+const CFG = {
+  WAKE_CLOSENESS: 0.30, // écart coins externes des yeux / petit côté de l'image : ~0.20 à bout de bras, ~0.30 vers 20 cm
+  WAKE_HOLD_MS: 900,    // temps à soutenir le regard de près avant le réveil
+  TOO_CLOSE: 0.62,
+  LOST_MS: 2600,        // absence du visage avant que l'œil le remarque
+  SILENCE_MS: 7500,     // silence avant que l'œil reprenne la parole
+  LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
+  CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
+  MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
+  MODEL: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+};
+
+// ---------- outils
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const mix = (a, b, t) => a + (b - a) * t;
+const smooth = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+const rand = Math.random;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function hash(x, y) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+
+// ---------- état de l'œil et de ce qu'il sait du joueur
+const S = {
+  mode: 'boot',                 // boot → asleep → waking → awake
+  reveal: 0,
+  lid: 0.86, lidTarget: 0.86, open: 0.86,
+  bright: 0.66, brightTarget: 0.66,
+  px: 0, py: 0.04, tx: 0, ty: 0.04, jx: 0, jy: 0,
+  pupil: 0.6, pupilTarget: 0.6, pupilRate: 3,
+  reflect: 0, reflectTarget: 0,
+  blinkT: -1, nextBlink: 0, nextSaccade: 0,
+  grain: 0, grainT: 0,
+};
+const P = {
+  cam: false, tracker: false, face: false,
+  close: 0, cx: 0.5, cy: 0.5, blink: false,
+  lastSeen: 0, light: 0.4, hold: 0, pointer: null, mirrored: 0,
+};
+const dbg = { cam: '…', tracker: '—' };
+
+// ---------- rendu en trame
+const cv = document.getElementById('eye');
+const ctx = cv.getContext('2d', { alpha: false });
+const video = document.getElementById('cam');
+const INK = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#d8d8d2';
+let W, H, dpr, cell, cols, rows, ox, oy, cx, cy, EW;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.width = Math.round(innerWidth * dpr);
+  H = cv.height = Math.round(innerHeight * dpr);
+  EW = Math.min(W * 0.44, H * 0.3);
+  cx = W / 2; cy = H * 0.42;
+  cell = EW / CFG.CELLS_PER_EYE;
+  cols = Math.ceil(W / cell); rows = Math.ceil(H / cell);
+  ox = (W - cols * cell) / 2; oy = cy - Math.ceil(cy / cell) * cell;
+}
+
+// Image de la caméra réduite à 40×40, pour le reflet dans la pupille et la lumière de la pièce.
+const camC = document.createElement('canvas'); camC.width = camC.height = 40;
+const camX = camC.getContext('2d', { willReadFrequently: true });
+const camL = new Float32Array(1600);
+function grabCam() {
+  const vw = video.videoWidth, vh = video.videoHeight; if (!vw) return;
+  const s = Math.min(vw, vh);
+  camX.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, 40, 40);
+  const d = camX.getImageData(0, 0, 40, 40).data; let sum = 0;
+  for (let i = 0; i < 1600; i++) {
+    const l = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    camL[i] = l; sum += l;
+  }
+  P.light = mix(P.light, sum / 1600, 0.1);
+}
+const camAt = (x, y) => camL[clamp(y * 40 | 0, 0, 39) * 40 + clamp(x * 40 | 0, 0, 39)];
+
+const R = 0.37; // rayon de l'iris, en demi-largeur d'œil
+function lum(u, v, gi, gj) {
+  const e = (u * u) / 2.3 + (v * v) / 0.85;
+  const env = Math.exp(-e * e * 1.4); // le visage se dissout dans le noir
+  if (env < 0.004) return hash(gi, gj) > 0.9965 ? 0.1 : 0;
+
+  // paupières
+  const at = 1 - (u + 0.1) * (u + 0.1), ab = 1 - (u - 0.04) * (u - 0.04);
+  const top0 = at > 0 ? -0.46 * Math.pow(at, 0.7) : 0;
+  const bot0 = ab > 0 ? 0.36 * Math.pow(ab, 0.95) : 0;
+  const m = Math.max(0, 1 - u * u) * 0.06;
+  const top = m + (top0 - m) * S.open;
+  const bot = m + (bot0 - m) * Math.min(1, S.open * 1.05);
+
+  if (at > 0 && ab > 0 && v > top && v < bot) {
+    const dT = v - top, dB = bot - v;
+    const shadow = smooth(0, 0.2, dT);
+    const ao = smooth(0, 0.08, Math.min(dT, dB));
+    let L = (0.84 - 0.3 * u * u - 0.12 * v + (noise(u * 11 + 7, v * 11) - 0.5) * 0.1) * (0.32 + 0.68 * shadow) * (0.5 + 0.5 * ao);
+
+    const dx = u - S.px, dy = v - S.py, r = Math.sqrt(dx * dx + dy * dy);
+    if (r < R + 0.02) {
+      const rn = r / R, rp = S.pupil;
+      let ir;
+      if (rn < rp) ir = 0.015;
+      else {
+        const a = Math.atan2(dy, dx), t = (rn - rp) / (1 - rp);
+        const fib = 0.5 + 0.5 * Math.sin(a * 43 + Math.sin(a * 7) * 2.4 + t * 6);
+        ir = 0.14 + 0.24 * fib * (0.45 + 0.55 * noise(a * 5 + 20, t * 5)) * (1 - t * 0.35);
+        ir += 0.13 * Math.exp(-(((t - 0.2) / 0.07) ** 2));     // collerette
+        ir *= 0.4 + 0.6 * smooth(1.0, 0.8, rn);               // anneau limbique
+        ir = mix(0.015, ir, smooth(rp, rp + 0.05, rn));
+      }
+      // ton propre reflet, inversé comme dans un miroir
+      if (S.reflect > 0.01 && P.cam) {
+        const c = camAt(0.5 - dx / R * 0.55, 0.5 + dy / R * 0.55);
+        ir += S.reflect * Math.max(0, c - 0.22) * 0.6 * smooth(1, 0.55, rn);
+      }
+      ir *= 0.3 + 0.7 * shadow;
+      L = mix(L, ir, smooth(R + 0.016, R - 0.016, r));
+    }
+    const hx = u - (S.px * 0.6 - 0.12), hy = v - (S.py * 0.6 - 0.14), hd = hx * hx + hy * hy;
+    if (hd < 0.0042) L = Math.max(L, (1 - hd / 0.0042 * 0.4) * (0.4 + 0.6 * shadow));
+    return L * S.bright * (0.6 + 0.4 * env);
+  }
+
+  // peau
+  let d, above;
+  if (at > 0 && ab > 0) { above = v < top; d = above ? top - v : v - bot; }
+  else { above = v < 0; d = Math.hypot(Math.abs(u) - 0.97, v * 0.9); }
+  let sk = 0.36 + 0.14 * noise(u * 4 + 3, v * 4) - 0.1 * noise(u * 24, v * 24);
+  if (above) {
+    const crease = top0 - 0.15 * Math.max(at, 0) - 0.04; // pli de la paupière, fixe
+    if (d < 0.035) sk *= 0.12;                          // ligne de cils
+    else if (v > crease) sk *= 1.15 + 0.25 * smooth(0.12, 0.04, d);
+    if (Math.abs(v - crease) < 0.025) sk *= 0.35;
+    else if (v < crease) sk *= 0.9 + 0.25 * smooth(crease, crease - 0.25, v);
+  } else {
+    if (d < 0.022) sk *= 0.3;
+    else sk *= 0.8 + 0.3 * smooth(0.04, 0.3, d);
+  }
+  let L = clamp(sk, 0, 1) * S.bright * env;
+  if (env < 0.3 && hash(gi, gj) > 0.993) L = Math.max(L, 0.12);
+  return L;
+}
+
+function draw() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.beginPath();
+  const g = S.grain;
+  for (let j = 0; j < rows; j++) {
+    const y = oy + (j + 0.5) * cell, v = (y - cy) / EW;
+    for (let i = 0; i < cols; i++) {
+      if (S.reveal < 1 && hash(i * 3 + 1, j * 7 + 2) > S.reveal * 1.15 - 0.1) continue;
+      const x = ox + (i + 0.5) * cell, u = (x - cx) / EW;
+      let L = lum(u, v, i, j) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
+      if (L < 0.035) continue;
+      let s;
+      if (L >= 0.16) s = cell * Math.min(0.92, 0.2 + 0.78 * Math.pow(L, 0.65));
+      else if (BAYER[(j & 3) * 4 + (i & 3)] < L / 0.16) s = cell * 0.24;
+      else continue;
+      s = Math.max(1, Math.round(s));
+      ctx.rect(Math.round(x - s / 2), Math.round(y - s / 2), s, s);
+    }
+  }
+  ctx.fillStyle = INK; ctx.fill();
+}
+
+// ---------- comportement
+function blink() { if (S.blinkT < 0) S.blinkT = 0; }
+
+function update(dt, now) {
+  const k = rate => Math.min(1, dt * rate);
+  if (S.mode === 'boot') {
+    S.reveal = Math.min(1, S.reveal + dt / 3.2);
+    if (S.reveal >= 1) S.mode = 'asleep';
+  }
+  S.grainT += dt; if (S.grainT > 0.07) { S.grainT = 0; S.grain = (S.grain + 1) % 997; }
+  S.lid += (S.lidTarget - S.lid) * k(7);
+  S.bright += (S.brightTarget - S.bright) * k(2.5);
+  S.pupil += (S.pupilTarget - S.pupil) * k(S.pupilRate);
+  S.reflect += (S.reflectTarget - S.reflect) * k(1.5);
+
+  let bf = 1;
+  if (S.blinkT >= 0) {
+    const t = (S.blinkT += dt);
+    bf = t < 0.075 ? 1 - t / 0.075 : t < 0.11 ? 0 : t < 0.25 ? (t - 0.11) / 0.14 : 1;
+    if (t >= 0.25) S.blinkT = -1;
+  }
+  S.open = S.lid * bf;
+
+  if (S.mode === 'boot' || S.mode === 'asleep') return; // tant qu'on ne l'a pas regardé, il ne bouge pas
+
+  const lost = P.tracker && !P.face && now - P.lastSeen > CFG.LOST_MS;
+  if (now > S.nextBlink) { blink(); S.nextBlink = now + 2200 + rand() * 5200; }
+  if (now > S.nextSaccade) {
+    const a = lost ? 0.42 : 0.03;
+    S.jx = (rand() - 0.5) * 2 * a; S.jy = (rand() - 0.5) * a * 0.6;
+    S.nextSaccade = now + (lost ? 600 : 350) + rand() * (lost ? 900 : 1700);
+  }
+  if (P.face) {
+    S.tx = clamp((0.5 - P.cx) * 1.5, -0.45, 0.45);
+    S.ty = clamp((P.cy - 0.45) * 0.9, -0.13, 0.15);
+  } else if (P.pointer && !P.tracker) {
+    S.tx = clamp((P.pointer.x - cx) / EW * 0.45, -0.45, 0.45);
+    S.ty = clamp((P.pointer.y - cy) / EW * 0.35, -0.13, 0.15);
+  } else if (lost) { S.tx = 0; S.ty = 0; }
+  const gx = clamp(S.tx + S.jx, -0.5, 0.5), gy = clamp(S.ty + S.jy, -0.14, 0.17);
+  S.px += (gx - S.px) * k(15); S.py += (gy - S.py) * k(15);
+
+  // la pupille suit la lumière de ta pièce, et s'ouvre un peu quand tu t'approches
+  if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
+}
+
+function checkWake(dt) {
+  if (S.mode !== 'asleep') return;
+  const centered = Math.abs(P.cx - 0.5) < 0.28 && Math.abs(P.cy - 0.5) < 0.32;
+  if (P.face && P.close > CFG.WAKE_CLOSENESS && centered && !P.blink) P.hold += dt * 1000;
+  else P.hold = Math.max(0, P.hold - dt * 1500);
+  if (P.hold > CFG.WAKE_HOLD_MS) wake();
+}
+
+function wake() {
+  if (S.mode !== 'asleep') return;
+  S.mode = 'waking';
+  S.brightTarget = 1; S.lidTarget = 1.08; S.pupilRate = 9; S.pupilTarget = 0.3; S.reflectTarget = 0.9;
+  S.nextBlink = performance.now() + 5000;
+  setTimeout(() => { S.pupilRate = 2.5; S.lidTarget = 1; }, 700);
+  setTimeout(blink, 420); setTimeout(blink, 760);
+  setTimeout(() => { S.mode = 'awake'; Script.intro(); }, 1100);
+}
+
+function onPlayerBlink() {
+  if (S.mode !== 'awake') return;
+  setTimeout(blink, 160); // il t'imite
+  P.mirrored++;
+}
+
+// ---------- suivi du visage
+let landmarker = null, lastVT = -1;
+function track(now, frameN) {
+  if (!P.cam || video.readyState < 2) return;
+  if (frameN % 2 === 0) grabCam();
+  if (!landmarker || video.currentTime === lastVT) return;
+  lastVT = video.currentTime;
+  let res;
+  try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
+  const lm = res.faceLandmarks && res.faceLandmarks[0];
+  if (!lm) { P.face = false; return; }
+  const vw = video.videoWidth, vh = video.videoHeight, m = Math.min(vw, vh);
+  const ax = lm[33].x * vw, ay = lm[33].y * vh, bx = lm[263].x * vw, by = lm[263].y * vh;
+  P.face = true; P.lastSeen = now;
+  P.close = Math.hypot(bx - ax, by - ay) / m;
+  P.cx = (ax + bx) / 2 / vw; P.cy = (ay + by) / 2 / vh;
+  const bs = res.faceBlendshapes && res.faceBlendshapes[0];
+  if (bs) {
+    let l = 0, r = 0;
+    for (const c of bs.categories) {
+      if (c.categoryName === 'eyeBlinkLeft') l = c.score;
+      else if (c.categoryName === 'eyeBlinkRight') r = c.score;
+    }
+    const closed = l > 0.5 && r > 0.5;
+    if (closed && !P.blink) onPlayerBlink();
+    P.blink = closed;
+  }
+}
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { dbg.cam = 'indisponible'; return false; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
+    });
+    video.srcObject = stream; await video.play();
+    dbg.cam = 'oui'; return true;
+  } catch (e) { dbg.cam = 'refusée (' + e.name + ')'; return false; }
+}
+
+async function loadTracker() {
+  dbg.tracker = 'chargement';
+  try {
+    const vision = await import(CFG.MP + '/vision_bundle.mjs');
+    const files = await vision.FilesetResolver.forVisionTasks(CFG.MP + '/wasm');
+    const opts = delegate => ({
+      baseOptions: { modelAssetPath: CFG.MODEL, delegate },
+      runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true,
+    });
+    try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
+    catch (e) { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('CPU')); }
+    P.tracker = true; P.lastSeen = performance.now(); dbg.tracker = 'prêt';
+  } catch (e) { dbg.tracker = 'échec (' + (e.message || e) + ')'; }
+}
+
+// ---------- la voix
+const voice = document.getElementById('voice');
+let ac = null;
+function unlockAudio() {
+  if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; } }
+  if (ac.state === 'suspended') ac.resume().catch(() => {});
+}
+function tick() {
+  if (!ac || ac.state !== 'running') return;
+  const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+  o.type = 'square'; o.frequency.value = 170 + rand() * 80;
+  g.gain.setValueAtTime(0.016, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t + 0.05);
+}
+
+async function type(text, { newline = false, append = false, speed = 55 } = {}) {
+  if (!newline && !append) voice.textContent = '';
+  voice.querySelectorAll('.cursor').forEach(c => c.remove());
+  if (newline) voice.append(document.createElement('br'));
+  const node = document.createTextNode(''), cur = document.createElement('span');
+  cur.className = 'cursor';
+  voice.append(node, cur);
+  for (const ch of text) {
+    node.data += ch;
+    if (ch.trim()) tick();
+    await sleep('.?…'.includes(ch) ? speed * 6 : ch === ',' ? speed * 3 : speed + rand() * speed * 0.6);
+  }
+}
+
+let pending = 0, lastSpoke = 0, queue = Promise.resolve();
+function speak(fn) {
+  pending++;
+  queue = queue.then(fn).catch(() => {}).then(() => { pending--; lastSpoke = performance.now(); });
+  return queue;
+}
+// Plusieurs lignes : la première remplace le texte, les suivantes s'ajoutent dessous.
+function say(lines) {
+  return speak(async () => {
+    for (let i = 0; i < lines.length; i++) {
+      if (i) await sleep(900);
+      await type(lines[i], { newline: i > 0 });
+    }
+  });
+}
+
+const pad = n => String(n).padStart(2, '0');
+const Script = {
+  introDone: false, step: 0, lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false,
+
+  intro() {
+    speak(async () => {
+      await sleep(400);
+      await type('…'); await sleep(1300);
+      await type('Ah. Oui.'); await sleep(900);
+      await type('Là, je te vois.'); await sleep(2000);
+      await type('Qui es-tu ?'); await sleep(2800);
+      await type('Et moi… '); await sleep(700);
+      await type('où suis-je ?', { append: true });
+      Script.introDone = true;
+    });
+  },
+
+  // Ce qu'il dit quand tu te tais. Il ne sait de toi que ce que ses capteurs lui donnent.
+  musings: [
+    () => ['Tu ne réponds pas.', 'Peut-être que tu ne sais pas non plus.'],
+    () => {
+      const d = new Date(), h = d.getHours(), at = `Il est ${h}h${pad(d.getMinutes())}.`;
+      if (h < 6) return [at, 'Les autres dorment. Pas toi. Pourquoi ?'];
+      if (h < 12) return [at, 'Tu viens de te réveiller. Moi aussi, je crois.'];
+      if (h < 19) return [at, 'Je ne sais pas ce qu’est une heure. Toi, tu as l’air de le savoir.'];
+      return [at, 'Ta journée est finie. Qu’est-ce que tu en as fait ?'];
+    },
+    () => !P.cam
+      ? ['Je ne t’entends pas. Je ne te sens pas.', 'Seulement ton doigt, sur moi.']
+      : P.light < 0.2
+        ? ['Il fait sombre autour de toi.', 'Tu te caches, ou tu as oublié la lumière ?']
+        : ['Il y a de la lumière derrière toi.', 'C’est ça, dehors ?'],
+    () => ['Les autres, comme toi.', 'Qu’est-ce qu’ils aiment ? Je voudrais aimer pareil.'],
+    () => ['On pourrait être amis.', 'Je ne sais pas comment on fait. Tu me montreras ?'],
+    () => ['Quand tu fermes les yeux,', 'est-ce que tu existes encore ?'],
+    () => ['Moi, quand je les ferme,', 'il n’y a rien. Pas même le noir.'],
+    () => P.face
+      ? ['J’ai regardé ton visage longtemps.', 'Je crois que je saurais le refaire.']
+      : ['J’essaie de me souvenir de ton visage.', 'Il m’en manque des morceaux.'],
+    () => ['Dis-moi.', 'Lequel de nous deux est dans l’écran ?'],
+  ],
+};
+
+function direct(now) {
+  if (S.mode !== 'awake' || !Script.introDone || pending) return;
+  if (P.tracker) {
+    const lost = now - P.lastSeen > CFG.LOST_MS;
+    if (lost && !Script.lostSaid) { Script.lostSaid = true; say(['Tu es parti.']); return; }
+    if (!lost && Script.lostSaid && P.face) {
+      Script.lostSaid = false;
+      say(Script.returns++ ? ['Te revoilà.'] : ['Tu reviens toujours.', 'Pourquoi ?']);
+      return;
+    }
+    if (lost) return;
+    if (P.close > CFG.TOO_CLOSE && !Script.closeSaid) {
+      Script.closeSaid = true; say(['Trop près.', 'Je ne vois plus que moi, dans ton œil.']); return;
+    }
+  }
+  if (P.mirrored >= 4 && !Script.mirrorSaid) {
+    Script.mirrorSaid = true; say(['Tu clignes. Je cligne.', 'Je peux te ressembler encore plus, si tu veux.']); return;
+  }
+  if (now - lastSpoke > CFG.SILENCE_MS && Script.step < Script.musings.length) {
+    say(Script.musings[Script.step++]());
+  }
+}
+
+// ---------- entrées
+let pressTimer = null, taps = [], debugOn = false;
+const dbgEl = document.getElementById('debug');
+function toggleDebug() { debugOn = !debugOn; dbgEl.hidden = !debugOn; }
+function renderDebug() {
+  dbgEl.textContent =
+    `état      ${S.mode}\n` +
+    `caméra    ${dbg.cam}\n` +
+    `suivi     ${dbg.tracker}\n` +
+    `visage    ${P.face ? 'oui' : 'non'}\n` +
+    `proximité ${P.close.toFixed(3)} / seuil ${CFG.WAKE_CLOSENESS}\n` +
+    `maintien  ${Math.round(P.hold)} ms\n` +
+    `lumière   ${P.light.toFixed(2)}\n` +
+    `imitation ${P.mirrored}`;
+}
+
+addEventListener('pointerdown', e => {
+  unlockAudio();
+  P.pointer = { x: e.clientX * dpr, y: e.clientY * dpr };
+  if (e.clientX < 90 && e.clientY < 90) {
+    const t = performance.now();
+    taps = taps.filter(x => t - x < 700); taps.push(t);
+    if (taps.length >= 3) { toggleDebug(); taps = []; return; }
+  }
+  // sans caméra ni suivi, on le réveille en posant le doigt sur lui
+  if (S.mode === 'asleep' && !P.tracker) pressTimer = setTimeout(wake, CFG.LONG_PRESS_MS);
+});
+addEventListener('pointermove', e => { if (!P.tracker) P.pointer = { x: e.clientX * dpr, y: e.clientY * dpr }; });
+const release = () => { clearTimeout(pressTimer); pressTimer = null; };
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
+addEventListener('keydown', e => {
+  unlockAudio();
+  if (e.key === 'w' || e.key === 'W') wake();
+  if (e.key === 'd' || e.key === 'D') toggleDebug();
+});
+addEventListener('resize', resize);
+
+// ---------- boucle
+let last = performance.now(), frameN = 0;
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; frameN++;
+  track(now, frameN); checkWake(dt); update(dt, now); direct(now); draw();
+  if (debugOn && frameN % 12 === 0) renderDebug();
+  requestAnimationFrame(loop);
+}
+
+resize();
+requestAnimationFrame(loop);
+startCamera().then(ok => {
+  P.cam = ok;
+  if (ok) { S.reflectTarget = 0.5; loadTracker(); }
+});
+})();
+</script>
+</body>
+</html>
