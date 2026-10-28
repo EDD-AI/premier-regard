@@ -3,13 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Premier Regard</title>
+<title>.</title>
+<meta name="description" content=".">
 <meta name="theme-color" content="#000000">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content=".">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<!-- miniature quand on partage le lien : un point -->
+<meta property="og:title" content=".">
+<meta property="og:description" content=".">
+<meta property="og:image" content="https://edd-ai.github.io/premier-regard/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://edd-ai.github.io/premier-regard/og.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=VT323&display=swap">
@@ -50,6 +62,7 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
 <pre id="debug" hidden></pre>
 
 <script>
+// Séquence 1 : Premier Regard. La première des séquences où l'on retrouve l'œil.
 (() => {
 'use strict';
 
@@ -71,6 +84,10 @@ const CFG = {
   NOD_RANGE: 0.08,      // amplitude d'un « oui » de la tête (en écarts d'yeux)
   SHAKE_RANGE: 0.10,    // amplitude d'un « non »
   EYES_SHUT_MS: 2500,   // yeux fermés assez longtemps pour qu'il le remarque
+  WAVE_RANGE: 0.10,     // amplitude d'un coucou de la main (fraction de la largeur de l'image)
+  WAVE_MOTION: 0.05,    // si le suivi des mains échoue : mouvement de l'image qui vaut un coucou
+  TAPS_NEEDED: 5,       // tapotements sur l'écran pour lui montrer à quoi servent tes mains
+  HAND_MODEL: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -107,7 +124,7 @@ const S = {
   reflect: 0, reflectTarget: 0,
   blinkT: -1, blinkScale: 1.7, nextBlink: 0, nextSaccade: 0,
   grain: 0, grainT: 0,
-  roll: 0, demo: null,
+  roll: 0, demo: null, look: null,
   morph: 0, faceFlip: false, glitch: false, // quand il devient toi
 };
 const P = {
@@ -118,6 +135,7 @@ const P = {
   camDone: false, trackerFailed: false,
   bs: {}, yaw: 0, pitch: 0, roll: 0, closedAt: 0, longCloseAt: -1e9, lastGesture: null,
   faceLight: 0, lostLit: false,
+  motion: 0, hand: false, waveHold: 0, taps: 0,
 };
 const ex = name => P.bs[name] || 0; // score d'une expression du visage, 0..1
 const wakeAt = () => Math.max(CFG.WAKE_MIN, P.base * CFG.WAKE_RATIO);
@@ -149,12 +167,14 @@ function grabCam() {
   const vw = video.videoWidth, vh = video.videoHeight; if (!vw) return;
   const s = Math.min(vw, vh);
   camX.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, 40, 40);
-  const d = camX.getImageData(0, 0, 40, 40).data; let sum = 0;
+  const d = camX.getImageData(0, 0, 40, 40).data; let sum = 0, mo = 0;
   for (let i = 0; i < 1600; i++) {
     const l = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    mo += Math.abs(l - camL[i]);
     camL[i] = l; sum += l;
   }
   P.light = mix(P.light, sum / 1600, 0.1);
+  P.motion = mix(P.motion, mo / 1600, 0.3); // ce qui bouge devant lui
   // netteté de l'image : elle s'effondre quand un œil est collé à l'objectif (flou, plein cadre)
   let g = 0;
   for (let y = 0; y < 39; y++) for (let x = 0; x < 39; x++) {
@@ -231,10 +251,25 @@ function lum(u, v, gi, gj) {
   return L;
 }
 
+// Là où tu touches l'écran, les points de la trame ondulent un instant, comme une surface.
+const ripples = [];
+function addRipple(x, y) {
+  ripples.push({ x, y, t0: performance.now() });
+  if (ripples.length > 8) ripples.shift();
+}
+
 function draw() {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   ctx.beginPath();
   const g = S.grain, cr = Math.cos(S.roll), sr = Math.sin(S.roll);
+  const nowR = performance.now(), R2 = (cell * 12) ** 2, act = [];
+  for (const r of ripples) {
+    const age = (nowR - r.t0) / 1000;
+    if (age < 0.9) act.push({
+      x: r.x, y: r.y, age,
+      amp: cell * 0.45 * (1 - age / 0.9) ** 2, glow: 0.22 * (1 - age / 0.9), front: cell * (1.5 + age * 16),
+    });
+  }
   for (let j = 0; j < rows; j++) {
     const y = oy + (j + 0.5) * cell, v0 = (y - cy) / EW;
     for (let i = 0; i < cols; i++) {
@@ -244,13 +279,22 @@ function draw() {
       // pendant la transformation, chaque point bascule de l'œil à ton visage, au hasard, du centre vers les bords
       const toFace = S.morph > 0 && hash(i * 5 + 3, j * 11 + 7) * 0.75 + Math.min(1, Math.hypot(u0, v0) / 2.2) * 0.25 < S.morph;
       let L = (toFace ? faceLum(x, y, j) : lum(u, v, i, j)) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
+      // sous ton doigt : les points s'écartent, et un anneau très faible s'étend, même dans le noir
+      let px = x, py = y;
+      for (const r of act) {
+        const ddx = x - r.x, ddy = y - r.y, d2 = ddx * ddx + ddy * ddy;
+        if (d2 > R2) continue;
+        const dd = Math.sqrt(d2) + 1e-3, w = r.amp * Math.sin(dd / cell * 1.6 - r.age * 14) * Math.exp(-dd / (cell * 4));
+        px += ddx / dd * w; py += ddy / dd * w;
+        L += r.glow * Math.exp(-(((dd - r.front) / (cell * 1.6)) ** 2));
+      }
       if (L < 0.035) continue;
       let s;
       if (L >= 0.16) s = cell * Math.min(0.92, 0.2 + 0.78 * Math.pow(L, 0.65));
       else if (BAYER[(j & 3) * 4 + (i & 3)] < L / 0.16) s = cell * 0.24;
       else continue;
       s = Math.max(1, Math.round(s));
-      ctx.rect(Math.round(x - s / 2), Math.round(y - s / 2), s, s);
+      ctx.rect(Math.round(px - s / 2), Math.round(py - s / 2), s, s);
     }
   }
   ctx.fillStyle = INK; ctx.fill();
@@ -313,6 +357,11 @@ function update(dt, now) {
     S.tx = clamp((P.pointer.x - cx) / EW * 0.45, -0.45, 0.45);
     S.ty = clamp((P.pointer.y - cy) / EW * 0.35, -0.13, 0.15);
   } else if (lost) { S.tx = 0; S.ty = 0; }
+  // il regarde un instant l'endroit où tu as touché l'écran
+  if (S.look && now < S.look.until) {
+    S.tx = clamp((S.look.x - cx) / EW * 0.45, -0.45, 0.45);
+    S.ty = clamp((S.look.y - cy) / EW * 0.35, -0.13, 0.15);
+  }
   // quand il te montre (ou te refait) oui / non : son regard monte et descend, ou va de gauche à droite
   let dx = 0, dy = 0;
   if (S.demo) {
@@ -372,6 +421,7 @@ function track(now, frameN) {
   if (frameN % 2 === 0) grabCam();
   if (!landmarker || video.currentTime === lastVT) return;
   lastVT = video.currentTime;
+  trackHands(now);
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   const lm = res.faceLandmarks && res.faceLandmarks[0];
@@ -536,8 +586,46 @@ async function loadTracker() {
     });
     try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
     catch (e) { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('CPU')); }
+    visionLib = vision; visionFiles = files;
     P.tracker = true; P.lastSeen = performance.now(); dbg.tracker = 'prêt';
   } catch (e) { P.trackerFailed = true; dbg.tracker = 'échec (' + (e.message || e) + ')'; }
+}
+
+// ---------- tes mains (chargées seulement quand il commence à s'y intéresser)
+let visionLib = null, visionFiles = null, handLandmarker = null, handFailed = false;
+async function loadHands() {
+  if (handLandmarker || handFailed) return;
+  if (!visionLib) { handFailed = true; dbg.hands = 'indisponible'; return; }
+  dbg.hands = 'chargement';
+  try {
+    const opts = delegate => ({ baseOptions: { modelAssetPath: CFG.HAND_MODEL, delegate }, runningMode: 'VIDEO', numHands: 1 });
+    try { handLandmarker = await visionLib.HandLandmarker.createFromOptions(visionFiles, opts('GPU')); }
+    catch (e) { handLandmarker = await visionLib.HandLandmarker.createFromOptions(visionFiles, opts('CPU')); }
+    dbg.hands = 'prêt';
+  } catch (e) { handFailed = true; dbg.hands = 'échec (' + (e.message || e) + ')'; }
+}
+// Un coucou : la main va et vient de gauche à droite, deux allers-retours au moins.
+const Wave = {
+  h: [],
+  push(t, x) {
+    const h = this.h;
+    h.push({ t, x });
+    while (h.length && t - h[0].t > 1500) h.shift();
+    const s = swings(h, 'x', 0.03);
+    if (h.length >= 6 && s.n >= 2 && s.range > CFG.WAVE_RANGE) { this.h = []; onWave(); }
+  },
+};
+function trackHands(now) {
+  if (!handLandmarker || !Script.task || Script.task.kind !== 'hello') return;
+  let res;
+  try { res = handLandmarker.detectForVideo(video, now); } catch (e) { return; }
+  const hand = res.landmarks && res.landmarks[0];
+  P.hand = !!hand;
+  if (hand) Wave.push(now, hand[9].x); else Wave.h = [];
+}
+function onWave() {
+  P.lastGesture = 'coucou';
+  if (Script.task && Script.task.kind === 'hello') Script.heardWave = true;
 }
 
 // ---------- la voix
@@ -590,7 +678,7 @@ function say(lines) {
 
 const pad = n => String(n).padStart(2, '0');
 const Script = {
-  introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false,
+  introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false,
   lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
@@ -603,6 +691,7 @@ const Script = {
       await type('Et moi… '); await sleep(700);
       await type('où suis-je ?', { append: true });
       Script.introDone = true; Script.stage = 'talk';
+      loadHands(); // pour plus tard, quand il demandera comment on dit bonjour
     });
   },
 
@@ -631,13 +720,19 @@ const Script = {
     () => ['Dis-moi.', 'Lequel de nous deux est dans l’écran ?'],
   ],
 
-  // L'ordre de la conversation : ses pensées (m) et ses questions (q), auxquelles on ne répond qu'avec la tête.
-  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
+  // L'ordre de la conversation : ses pensées (m), ses questions (q), auxquelles on ne répond qu'avec la tête,
+  // et l'épreuve des mains (h) : dire bonjour, puis toucher l'écran.
+  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
 
   next() {
     const item = Script.seq[Script.pos];
     if (!item) return;
     Script.pos++;
+    if (item === 'h') {
+      if (P.cam) Script.startTask('hello');
+      else { say(['Je ne vois pas tes mains.', 'Elles servent à quoi ?']); Script.startTask('touch'); }
+      return;
+    }
     const i = +item.slice(1);
     if (item[0] === 'm') { say(Script.musings[i]()); return; }
     Script.asking = { q: QUESTIONS[i], hint: 0 }; Script.heard = null;
@@ -679,6 +774,45 @@ const Script = {
     if (a.q.last) Script.end();
   },
 
+  // Épreuves sans mots : il faut trouver quoi faire devant lui.
+  tasks: {
+    hello: {
+      start: ['Chez vous.', 'Comment est-ce qu’on dit bonjour ?'],
+      hints: [
+        { after: 15000, lines: ['Avec la bouche ?', 'Avec les yeux ?', 'Avec autre chose ?'] },
+        { after: 17000, lines: ['Je vous ai vus faire, sur des images.', 'Vous levez quelque chose, et vous le balancez.'] },
+      ],
+      reask: ['Comment on dit bonjour, chez vous ?'],
+      done: ['Bonjour.', '|', 'Vos mains.', 'Elles vous servent à faire quoi d’autre ?'],
+      next: 'touch',
+    },
+    touch: {
+      hints: [
+        { after: 15000, lines: ['Montre-moi.'] },
+        { after: 17000, lines: ['Je suis juste là.', 'Derrière la vitre.'] },
+      ],
+      reask: ['Tes mains. Qu’est-ce qu’elles font d’autre ?'],
+      done: ['Tu frappes à la vitre.', 'Comme si je pouvais t’ouvrir.'],
+    },
+  },
+  startTask(kind) {
+    Script.task = { kind, hint: 0, count: 0, urged: false };
+    Script.heardWave = false;
+    const t = Script.tasks[kind];
+    if (t.start) say(t.start);
+  },
+  taskWait(now) {
+    const k = Script.task, t = Script.tasks[k.kind], h = t.hints[k.hint], quiet = now - lastSpoke;
+    if (h && quiet > h.after) { k.hint++; say(h.lines); }
+    else if (!h && quiet > 30000) say(t.reask);
+  },
+  taskDone() {
+    const t = Script.tasks[Script.task.kind];
+    Script.task = null;
+    say(t.done);
+    if (t.next) Script.startTask(t.next);
+  },
+
   // Il te propose de te ressembler, puis il le fait : ton visage à la place de l'œil, et ce n'est pas tout à fait toi.
   becomeYou() {
     say(['Tu clignes. Je cligne.', 'Je peux te ressembler encore plus, si tu veux.']);
@@ -694,7 +828,7 @@ const Script = {
     if (Script.asking) Script.reask();
   },
 
-  // Fin du chapitre : l'œil se ferme et se dissout. Il ne reste que le curseur.
+  // Fin de la séquence 1 : l'œil se ferme et se dissout. Il ne reste que le curseur.
   end() {
     Script.stage = 'ended';
     speak(async () => {
@@ -773,8 +907,19 @@ const Reactions = {
 function direct(dt, now) {
   if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
   Reactions.update(dt);
+  const task = Script.task;
+  // si le suivi des mains n'a pas pu se charger : un grand mouvement devant la caméra vaut un coucou
+  if (task && task.kind === 'hello' && handFailed && P.cam) {
+    P.waveHold = P.motion > CFG.WAVE_MOTION ? P.waveHold + dt * 1000 : 0;
+    if (P.waveHold > 900) { P.waveHold = 0; onWave(); }
+  }
   if (pending) return;
-  if (P.tracker) {
+  if (task) {
+    if (task.kind === 'hello' && Script.heardWave) { Script.heardWave = false; Script.taskDone(); return; }
+    if (task.kind === 'touch' && task.count >= CFG.TAPS_NEEDED) { Script.taskDone(); return; }
+    if (task.kind === 'touch' && task.count >= 2 && !task.urged) { task.urged = true; say(['Encore.']); return; }
+  }
+  if (P.tracker && !(task && task.kind === 'hello')) { // ta main peut cacher ton visage pendant le coucou
     const lost = now - P.lastSeen > CFG.LOST_MS;
     if (lost && !Script.lostSaid) { Script.lostSaid = true; say(['Tu es parti.']); return; }
     if (!lost && Script.lostSaid && P.face) {
@@ -798,6 +943,7 @@ function direct(dt, now) {
   }
   if (Reactions.fire(now)) return;
   if (Script.asking) { Script.wait(now); return; }
+  if (task) { Script.taskWait(now); return; }
   if (now - lastSpoke > CFG.SILENCE_MS) Script.next();
 }
 
@@ -821,8 +967,19 @@ function renderDebug() {
     `tête      lacet ${P.yaw.toFixed(2)}  tangage ${P.pitch.toFixed(2)}  roulis ${P.roll.toFixed(2)}\n` +
     `geste     ${P.lastGesture || '—'}\n` +
     `bouche    ${ex('jawOpen').toFixed(2)}  sourire ${((ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2).toFixed(2)}\n` +
-    `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}\n` +
+    `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}${Script.task ? ' (épreuve ' + Script.task.kind + ' ' + Script.task.count + ')' : ''}\n` +
+    `mains     ${dbg.hands || '—'}  main vue ${P.hand ? 'oui' : 'non'}  mouvement ${P.motion.toFixed(3)}  touchers ${P.taps}\n` +
     `imitation ${P.mirrored}`;
+}
+
+// Toucher l'écran : la trame ondule, il regarde ton doigt, et cligne si c'est lui que tu touches.
+function onTap(x, y) {
+  if (S.mode !== 'awake') return;
+  addRipple(x, y);
+  S.look = { x, y, until: performance.now() + 900 };
+  if (Math.abs((x - cx) / EW) < 1.05 && Math.abs((y - cy) / EW) < 0.5) blink();
+  P.taps++;
+  if (Script.task && Script.task.kind === 'touch') Script.task.count++;
 }
 
 addEventListener('pointerdown', e => {
@@ -833,6 +990,7 @@ addEventListener('pointerdown', e => {
     taps = taps.filter(x => t - x < 700); taps.push(t);
     if (taps.length >= 3) { toggleDebug(); taps = []; return; }
   }
+  onTap(e.clientX * dpr, e.clientY * dpr);
   // sans caméra ni suivi, on le réveille en posant le doigt sur lui
   // seulement si la caméra ou le suivi du visage ont définitivement échoué, pas pendant leur chargement
   if (S.mode === 'asleep' && P.camDone && (!P.cam || P.trackerFailed)) pressTimer = setTimeout(wake, CFG.LONG_PRESS_MS);
@@ -847,6 +1005,7 @@ addEventListener('keydown', e => {
   if (e.key === 'd' || e.key === 'D') toggleDebug();
   if (e.key === 'o' || e.key === 'O') onGesture('oui'); // test sur ordinateur
   if (e.key === 'n' || e.key === 'N') onGesture('non');
+  if (e.key === 'b' || e.key === 'B') onWave(); // coucou
   if ((e.key === 'm' || e.key === 'M') && S.mode === 'awake' && !Script.mirrorSaid) P.mirrored = 4; // déclenche la transformation
 });
 addEventListener('resize', resize);
