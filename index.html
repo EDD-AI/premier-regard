@@ -94,7 +94,7 @@ const S = {
   px: 0, py: 0.04, tx: 0, ty: 0.04, jx: 0, jy: 0,
   pupil: 0.6, pupilTarget: 0.6, pupilRate: 3,
   reflect: 0, reflectTarget: 0,
-  blinkT: -1, nextBlink: 0, nextSaccade: 0,
+  blinkT: -1, blinkScale: 1.7, nextBlink: 0, nextSaccade: 0,
   grain: 0, grainT: 0,
 };
 const P = {
@@ -234,7 +234,7 @@ function update(dt, now) {
   const k = rate => Math.min(1, dt * rate);
   if (S.mode === 'boot') {
     S.reveal = Math.min(1, S.reveal + dt / 3.2);
-    if (S.reveal >= 1) S.mode = 'asleep';
+    if (S.reveal >= 1) { S.mode = 'asleep'; S.nextBlink = now + 2000 + rand() * 2000; }
   }
   S.grainT += dt; if (S.grainT > 0.07) { S.grainT = 0; S.grain = (S.grain + 1) % 997; }
   S.lid += (S.lidTarget - S.lid) * k(7);
@@ -244,13 +244,23 @@ function update(dt, now) {
 
   let bf = 1;
   if (S.blinkT >= 0) {
-    const t = (S.blinkT += dt);
+    const t = (S.blinkT += dt) / S.blinkScale;
     bf = t < 0.075 ? 1 - t / 0.075 : t < 0.11 ? 0 : t < 0.25 ? (t - 0.11) / 0.14 : 1;
     if (t >= 0.25) S.blinkT = -1;
   }
   S.open = S.lid * bf;
 
-  if (S.mode === 'boot' || S.mode === 'asleep') return; // tant qu'on ne l'a pas regardé, il ne bouge pas
+  if (S.mode === 'boot') return;
+  if (S.mode === 'asleep') {
+    // il vit déjà, mais ne te voit pas encore : clignements lents, regard qui flotte à côté de toi
+    if (now > S.nextBlink) { blink(); S.nextBlink = now + 3500 + rand() * 6000; }
+    if (now > S.nextSaccade) {
+      S.jx = (rand() - 0.5) * 0.22; S.jy = 0.03 + (rand() - 0.5) * 0.08;
+      S.nextSaccade = now + 1400 + rand() * 3200;
+    }
+    S.px += (S.jx - S.px) * k(4); S.py += (S.jy - S.py) * k(4);
+    return;
+  }
 
   const lost = P.tracker && !P.face && now - P.lastSeen > CFG.LOST_MS;
   if (now > S.nextBlink) { blink(); S.nextBlink = now + 2200 + rand() * 5200; }
@@ -285,7 +295,8 @@ function wake() {
   if (S.mode !== 'asleep') return;
   S.mode = 'waking';
   S.brightTarget = 1; S.lidTarget = 1.08; S.pupilRate = 9; S.pupilTarget = 0.3; S.reflectTarget = 0.9;
-  S.nextBlink = performance.now() + 5000;
+  S.nextBlink = performance.now() + 5000; S.blinkScale = 1;
+  S.jx = S.jy = 0; S.nextSaccade = 0;
   setTimeout(() => { S.pupilRate = 2.5; S.lidTarget = 1; }, 700);
   setTimeout(blink, 420); setTimeout(blink, 760);
   setTimeout(() => { S.mode = 'awake'; Script.intro(); }, 1100);
