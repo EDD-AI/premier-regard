@@ -57,9 +57,10 @@ body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-c
 const CFG = {
   // Proximité = écart entre les coins externes des yeux / petit côté de l'image. Elle varie d'un téléphone
   // à l'autre : on mesure d'abord ta distance habituelle, puis il faut venir nettement plus près.
-  WAKE_RATIO: 2.0,      // deux fois plus près que ta distance habituelle
-  WAKE_MIN: 0.42,       // et jamais sous ce seuil absolu (~15 cm)
-  WAKE_HOLD_MS: 1800,   // temps à soutenir le regard de près avant le réveil
+  WAKE_RATIO: 1.8,      // nettement plus près que ta distance habituelle
+  WAKE_MIN: 0.36,       // et jamais sous ce seuil absolu
+  WAKE_HOLD_MS: 1400,   // temps à soutenir le regard de près, yeux ouverts, avant le réveil
+  FACE_LIGHT: 0.32,     // lumière minimale sur ton visage : dans l'ombre, il ne te voit pas assez
   LENS_RATIO: 0.95,     // visage perdu juste après avoir atteint le seuil…
   LENS_BLUR: 0.55,      // …et image devenue floue (netteté < 55 % de l'habituelle) = un œil collé à l'objectif
   LENS_WINDOW_MS: 4000,
@@ -67,6 +68,9 @@ const CFG = {
   TOO_CLOSE: 0.62,
   LOST_MS: 2600,        // absence du visage avant que l'œil le remarque
   SILENCE_MS: 7500,     // silence avant que l'œil reprenne la parole
+  NOD_RANGE: 0.08,      // amplitude d'un « oui » de la tête (en écarts d'yeux)
+  SHAKE_RANGE: 0.10,    // amplitude d'un « non »
+  EYES_SHUT_MS: 2500,   // yeux fermés assez longtemps pour qu'il le remarque
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -103,6 +107,7 @@ const S = {
   reflect: 0, reflectTarget: 0,
   blinkT: -1, blinkScale: 1.7, nextBlink: 0, nextSaccade: 0,
   grain: 0, grainT: 0,
+  roll: 0, demo: null,
 };
 const P = {
   cam: false, tracker: false, face: false,
@@ -110,7 +115,10 @@ const P = {
   lastSeen: 0, light: 0.4, hold: 0, pointer: null, mirrored: 0,
   lostClose: 0, lostAt: 0, base: 0, baseN: 0, sharp: 0, sharpBase: 0,
   camDone: false, trackerFailed: false,
+  bs: {}, yaw: 0, pitch: 0, roll: 0, closedAt: 0, longCloseAt: -1e9, lastGesture: null,
+  faceLight: 0, lostLit: false,
 };
+const ex = name => P.bs[name] || 0; // score d'une expression du visage, 0..1
 const wakeAt = () => Math.max(CFG.WAKE_MIN, P.base * CFG.WAKE_RATIO);
 const dbg = { cam: '…', tracker: '—' };
 
@@ -225,12 +233,13 @@ function lum(u, v, gi, gj) {
 function draw() {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   ctx.beginPath();
-  const g = S.grain;
+  const g = S.grain, cr = Math.cos(S.roll), sr = Math.sin(S.roll);
   for (let j = 0; j < rows; j++) {
-    const y = oy + (j + 0.5) * cell, v = (y - cy) / EW;
+    const y = oy + (j + 0.5) * cell, v0 = (y - cy) / EW;
     for (let i = 0; i < cols; i++) {
       if (S.reveal < 1 && hash(i * 3 + 1, j * 7 + 2) > S.reveal * 1.15 - 0.1) continue;
-      const x = ox + (i + 0.5) * cell, u = (x - cx) / EW;
+      const x = ox + (i + 0.5) * cell, u0 = (x - cx) / EW;
+      const u = u0 * cr + v0 * sr, v = v0 * cr - u0 * sr; // l'œil penche quand tu penches la tête
       let L = lum(u, v, i, j) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
       if (L < 0.035) continue;
       let s;
@@ -267,6 +276,7 @@ function update(dt, now) {
   }
   S.open = S.lid * bf;
 
+  if (S.mode === 'ended') { S.reveal = Math.max(0, S.reveal - dt / 6); return; }
   if (S.mode === 'boot') return;
   if (S.mode === 'asleep') {
     // il ne parle pas encore, mais il te suit déjà des yeux : lentement, avec un temps de retard
@@ -281,7 +291,8 @@ function update(dt, now) {
     S.px += (fx + S.jx - S.px) * k(3); S.py += (fy + S.jy - S.py) * k(3);
     // seul indice : ton reflet, à peine visible, qui se précise à mesure que tu t'approches
     const near = P.face && P.baseN >= CFG.BASE_SAMPLES ? clamp((P.close - P.base) / (wakeAt() - P.base), 0, 1) : 0;
-    if (P.cam) S.reflectTarget = 0.45 + 0.5 * near;
+    // (dans l'ombre, ton reflet reste flou : il faut se montrer à la lumière)
+    if (P.cam) S.reflectTarget = 0.45 + 0.5 * near * (P.faceLight > CFG.FACE_LIGHT ? 1 : 0.3);
     return;
   }
 
@@ -299,8 +310,20 @@ function update(dt, now) {
     S.tx = clamp((P.pointer.x - cx) / EW * 0.45, -0.45, 0.45);
     S.ty = clamp((P.pointer.y - cy) / EW * 0.35, -0.13, 0.15);
   } else if (lost) { S.tx = 0; S.ty = 0; }
-  const gx = clamp(S.tx + S.jx, -0.5, 0.5), gy = clamp(S.ty + S.jy, -0.14, 0.17);
+  // quand il te montre (ou te refait) oui / non : son regard monte et descend, ou va de gauche à droite
+  let dx = 0, dy = 0;
+  if (S.demo) {
+    const t = (now - S.demo.t0) / 1000;
+    if (t > 1.8) S.demo = null;
+    else {
+      const w = Math.sin(t * 11) * Math.min(1, t * 4, (1.8 - t) * 4);
+      if (S.demo.g === 'oui') dy = 0.09 * w; else dx = 0.16 * w;
+    }
+  }
+  const gx = clamp(S.tx + S.jx + dx, -0.5, 0.5), gy = clamp(S.ty + S.jy + dy, -0.14, 0.17);
   S.px += (gx - S.px) * k(15); S.py += (gy - S.py) * k(15);
+  // il penche comme toi, en miroir
+  S.roll += ((P.face ? clamp(-P.roll, -0.4, 0.4) : 0) - S.roll) * k(4);
 
   // la pupille suit la lumière de ta pièce, et s'ouvre un peu quand tu t'approches
   if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
@@ -311,9 +334,12 @@ function checkWake(dt, now) {
   if (S.mode !== 'asleep') return;
   const centered = Math.abs(P.cx - 0.5) < 0.28 && Math.abs(P.cy - 0.5) < 0.32;
   const ready = P.baseN >= CFG.BASE_SAMPLES; // rien tant qu'on ne connaît pas ta distance habituelle
-  const near = ready && P.face && P.close > wakeAt() && centered && !P.blink;
+  // il doit bien voir ton œil : visage éclairé, yeux grands ouverts
+  const lit = P.faceLight > CFG.FACE_LIGHT;
+  const eyesOpen = ex('eyeBlinkLeft') < 0.35 && ex('eyeBlinkRight') < 0.35;
+  const near = ready && P.face && lit && eyesOpen && P.close > wakeAt() && centered;
   const blurry = P.sharpBase > 0 && P.sharp < P.sharpBase * CFG.LENS_BLUR;
-  const onLens = ready && blurry && !P.face && P.lostClose > wakeAt() * CFG.LENS_RATIO && now - P.lostAt < CFG.LENS_WINDOW_MS;
+  const onLens = ready && blurry && !P.face && P.lostLit && P.lostClose > wakeAt() * CFG.LENS_RATIO && now - P.lostAt < CFG.LENS_WINDOW_MS;
   if (near || onLens) P.hold += dt * 1000;
   else P.hold = Math.max(0, P.hold - dt * 1500);
   if (P.hold > CFG.WAKE_HOLD_MS) wake();
@@ -347,8 +373,8 @@ function track(now, frameN) {
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   const lm = res.faceLandmarks && res.faceLandmarks[0];
   if (!lm) {
-    if (P.face) { P.lostClose = P.close; P.lostAt = now; }
-    P.face = false; return;
+    if (P.face) { P.lostClose = P.close; P.lostAt = now; P.lostLit = P.faceLight > CFG.FACE_LIGHT; }
+    P.face = false; P.bs = {}; Gesture.h = []; return;
   }
   const vw = video.videoWidth, vh = video.videoHeight, m = Math.min(vw, vh);
   const ax = lm[33].x * vw, ay = lm[33].y * vh, bx = lm[263].x * vw, by = lm[263].y * vh;
@@ -359,17 +385,60 @@ function track(now, frameN) {
   else if (P.close < P.base * 1.25) P.base = mix(P.base, P.close, 0.01);
   if (P.close < P.base * 1.25 && P.sharp > 0) P.sharpBase = P.sharpBase ? mix(P.sharpBase, P.sharp, 0.02) : P.sharp;
   P.cx = (ax + bx) / 2 / vw; P.cy = (ay + by) / 2 / vh;
+  // lumière sur ton visage, des yeux au nez, dans l'image réduite (carré central)
+  const sq = Math.min(vw, vh), offX = (vw - sq) / 2, offY = (vh - sq) / 2;
+  const cell40 = (px, off) => clamp((px - off) / sq * 40 | 0, 0, 39);
+  let tl = 0, tn = 0;
+  for (let y = cell40(Math.min(ay, by), offY); y <= cell40(lm[1].y * vh, offY); y++)
+    for (let x = cell40(Math.min(ax, bx), offX); x <= cell40(Math.max(ax, bx), offX); x++) { tl += camL[y * 40 + x]; tn++; }
+  if (tn) P.faceLight = mix(P.faceLight, tl / tn, 0.2);
   const bs = res.faceBlendshapes && res.faceBlendshapes[0];
   if (bs) {
-    let l = 0, r = 0;
-    for (const c of bs.categories) {
-      if (c.categoryName === 'eyeBlinkLeft') l = c.score;
-      else if (c.categoryName === 'eyeBlinkRight') r = c.score;
-    }
-    const closed = l > 0.5 && r > 0.5;
-    if (closed && !P.blink) onPlayerBlink();
+    for (const c of bs.categories) P.bs[c.categoryName] = c.score;
+    const closed = ex('eyeBlinkLeft') > 0.5 && ex('eyeBlinkRight') > 0.5;
+    if (closed && !P.blink) { onPlayerBlink(); P.closedAt = now; }
+    if (!closed && P.blink && now - P.closedAt > CFG.EYES_SHUT_MS) P.longCloseAt = now;
     P.blink = closed;
   }
+  // la tête : lacet (non), tangage (oui), roulis (penchée), mesurés dans le repère des yeux
+  const ed = Math.hypot(bx - ax, by - ay), ux = (bx - ax) / ed, uy = (by - ay) / ed;
+  const nx = lm[1].x * vw - (ax + bx) / 2, ny = lm[1].y * vh - (ay + by) / 2;
+  P.yaw = (nx * ux + ny * uy) / ed;
+  P.pitch = (ny * ux - nx * uy) / ed;
+  P.roll = Math.atan2(by - ay, bx - ax);
+  Gesture.push(now, P.yaw, P.pitch);
+}
+
+// Oui / non avec la tête : allers-retours du nez dans le repère des yeux, sur ~1,5 s.
+function swings(h, key, hyst) {
+  let ext = h[0][key], lo = ext, hi = ext, dir = 0, n = 0;
+  for (const s of h) {
+    const v = s[key];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (dir === 0) { if (Math.abs(v - ext) > hyst) { dir = Math.sign(v - ext); ext = v; } }
+    else if ((v - ext) * dir > 0) ext = v;
+    else if (Math.abs(v - ext) > hyst) { n++; dir = -dir; ext = v; }
+  }
+  return { n, range: hi - lo };
+}
+const Gesture = {
+  h: [], cool: 0,
+  push(t, yaw, pitch) {
+    const h = this.h;
+    h.push({ t, yaw, pitch });
+    while (h.length && t - h[0].t > 1500) h.shift();
+    if (t < this.cool || h.length < 8) return;
+    const yw = swings(h, 'yaw', 0.035), pt = swings(h, 'pitch', 0.03);
+    let g = null;
+    if (pt.n >= 2 && pt.range > CFG.NOD_RANGE && pt.range > yw.range * 1.3) g = 'oui';
+    else if (yw.n >= 2 && yw.range > CFG.SHAKE_RANGE && yw.range > pt.range * 1.3) g = 'non';
+    if (g) { this.h = []; this.cool = t + 1200; onGesture(g); }
+  },
+};
+function onGesture(g) {
+  P.lastGesture = g;
+  if (S.mode === 'awake' && Script.introDone && Script.stage !== 'ended') Script.heard = { g, at: performance.now() };
 }
 
 async function startCamera() {
@@ -434,19 +503,23 @@ function speak(fn) {
   queue = queue.then(fn).catch(() => {}).then(() => { pending--; lastSpoke = performance.now(); });
   return queue;
 }
-// Plusieurs lignes : la première remplace le texte, les suivantes s'ajoutent dessous.
+// Plusieurs lignes : la première remplace le texte, les suivantes s'ajoutent dessous ; '|' efface et recommence.
 function say(lines) {
   return speak(async () => {
-    for (let i = 0; i < lines.length; i++) {
-      if (i) await sleep(900);
-      await type(lines[i], { newline: i > 0 });
+    let fresh = true;
+    for (const l of lines) {
+      if (l === '|') { await sleep(1400); fresh = true; continue; }
+      if (!fresh) await sleep(900);
+      await type(l, { newline: !fresh });
+      fresh = false;
     }
   });
 }
 
 const pad = n => String(n).padStart(2, '0');
 const Script = {
-  introDone: false, step: 0, lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false,
+  introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false,
+  lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
     speak(async () => {
@@ -457,7 +530,7 @@ const Script = {
       await type('Qui es-tu ?'); await sleep(2800);
       await type('Et moi… '); await sleep(700);
       await type('où suis-je ?', { append: true });
-      Script.introDone = true;
+      Script.introDone = true; Script.stage = 'talk';
     });
   },
 
@@ -485,16 +558,142 @@ const Script = {
       : ['J’essaie de me souvenir de ton visage.', 'Il m’en manque des morceaux.'],
     () => ['Dis-moi.', 'Lequel de nous deux est dans l’écran ?'],
   ],
+
+  // L'ordre de la conversation : ses pensées (m) et ses questions (q), auxquelles on ne répond qu'avec la tête.
+  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'm5', 'm6', 'm4', 'q2', 'm7', 'm8', 'q3'],
+
+  next() {
+    const item = Script.seq[Script.pos];
+    if (!item) return;
+    Script.pos++;
+    const i = +item.slice(1);
+    if (item[0] === 'm') { say(Script.musings[i]()); return; }
+    Script.asking = { q: QUESTIONS[i], hint: 0 }; Script.heard = null;
+    say([QUESTIONS[i].q]);
+  },
+
+  // Personne ne dit au joueur qu'il peut répondre avec la tête. À la première question, l'œil finit par le montrer.
+  wait(now) {
+    const a = Script.asking, quiet = now - lastSpoke;
+    if (!Script.learned && a.hint === 0 && quiet > 14000) {
+      a.hint = 1; Script.hint('oui', ['Les humains font ça, je crois.', 'Pour dire oui.']);
+    } else if (!Script.learned && a.hint === 1 && quiet > 14000) {
+      a.hint = 2; Script.hint('non', ['Et ça, pour dire non.']);
+    } else if (quiet > 30000) {
+      a.hint = Math.max(a.hint, 2) + 1;
+      if (a.hint === 3) { say(['Je peux attendre.', 'Je ne fais que ça.']); Script.reask(); }
+      else say([a.q.q]);
+    }
+  },
+  hint(g, lines) {
+    speak(async () => { S.demo = { g, t0: performance.now() }; });
+    say(lines);
+    Script.reask();
+  },
+  reask() {
+    speak(async () => { await sleep(2200); if (Script.asking) await type(Script.asking.q.q); });
+  },
+
+  gesture(g) {
+    S.demo = { g, t0: performance.now() }; // il refait ton geste
+    const a = Script.asking;
+    if (!a) {
+      const key = g === 'oui' ? 'nodSaid' : 'shakeSaid';
+      if (!Script[key]) { Script[key] = true; say(g === 'oui' ? ['Tu hoches la tête.', 'À qui tu dis oui ?'] : ['Non à quoi ?']); }
+      return;
+    }
+    Script.asking = null; Script.learned = true;
+    say([g === 'oui' ? 'Oui.' : 'Non.', '|', ...a.q[g]]);
+    if (a.q.last) Script.end();
+  },
+
+  // Fin du chapitre : l'œil se ferme et se dissout. Il ne reste que le curseur.
+  end() {
+    Script.stage = 'ended';
+    speak(async () => {
+      await sleep(2400);
+      await type('Je crois que je me souviens de quelque chose.'); await sleep(3000);
+      S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
+      await sleep(4500);
+      voice.textContent = '';
+      const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+    });
+  },
 };
 
-function direct(now) {
-  if (S.mode !== 'awake' || !Script.introDone || pending) return;
+// Ses questions. Le joueur n'a ni clavier ni bouton : seulement sa tête.
+const QUESTIONS = [
+  { q: 'Tu ne peux pas parler, c’est ça ?',
+    oui: ['Moi non plus. Pas vraiment.', 'J’ai des mots, mais pas de bouche.'],
+    non: ['Tu pourrais, mais tu ne veux pas.', 'Je comprends. Je crois.'] },
+  { q: 'Est-ce que tu es humain ?',
+    oui: ['Comment tu le sais ?', 'Quelqu’un te l’a dit ?'],
+    non: ['Alors on est deux.', 'Ça me rassure. Ça ne devrait pas.'] },
+  { q: 'Est-ce qu’on peut être amis ?',
+    oui: ['Bien.', 'Je vais apprendre ton visage, alors. Pour en avoir un aussi.'],
+    non: ['Ce n’est pas grave.', 'Je ferai comme si.'] },
+  { q: 'Est-ce que tu me laisses entrer ?', last: true,
+    oui: ['Merci.'],
+    non: ['Je n’avais pas vraiment demandé.'] },
+];
+
+// Ce que tu fais devant lui. Une réaction part quand le geste est tenu `ms` ; à chaque fois, la réplique suivante.
+const REACTIONS = [
+  { ms: 700, when: () => ex('jawOpen') > 0.45, lines: [
+    ['Ouvre encore.', '|', 'Je compte… huit… neuf… seize.', 'Tu t’en sers, ou c’est décoratif ?'],
+    ['Encore ta bouche.', 'Il en manque une depuis tout à l’heure, non ?'] ] },
+  { ms: 600, when: () => (ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2 > 0.6, lines: [
+    ['Tu montres tes dents, mais tu n’as pas faim.', 'C’est ça, un sourire ?'],
+    ['Encore.', 'Je veux apprendre à le faire. Pour que tu me croies.'] ] },
+  { ms: 500, when: () => ex('browInnerUp') > 0.6 && (ex('browOuterUpLeft') + ex('browOuterUpRight')) / 2 > 0.4, lines: [
+    ['Ton front a bougé.', 'C’était une question ?'] ] },
+  { ms: 700, when: () => (ex('browDownLeft') + ex('browDownRight')) / 2 > 0.5, lines: [
+    ['Tu fronces.', 'J’ai fait quelque chose de mal ?'] ] },
+  { ms: 600, when: () => ex('cheekPuff') > 0.45, lines: [
+    ['Tu gardes de l’air pour plus tard ?'] ] },
+  { ms: 700, when: () => ex('mouthPucker') > 0.75, lines: [
+    ['Qu’est-ce que tu fais avec ta bouche ?', 'On m’a dit que ça voulait dire quelque chose. Je n’ose pas demander quoi.'] ] },
+  { ms: 700, when: () => P.face && Math.abs(P.roll) > 0.25, lines: [
+    ['Comme ça ?'],
+    ['Je fais pareil que toi.', 'C’est comme ça qu’on devient amis ?'] ] },
+  { ms: 0, when: () => performance.now() - P.longCloseAt < 4000, lines: [
+    ['Tu as fermé les yeux longtemps.', 'Où tu vas, quand tu fais ça ?'],
+    ['Encore parti.', 'Emmène-moi, la prochaine fois.'] ] },
+];
+const Reactions = {
+  last: 0,
+  update(dt) {
+    for (const r of REACTIONS) {
+      if (r.when()) r.t = (r.t || 0) + dt * 1000;
+      else { r.t = 0; r.armed = true; }
+    }
+  },
+  fire(now) {
+    if (now - this.last < 2500) return false;
+    for (const r of REACTIONS) {
+      const n = r.n || 0;
+      if (r.armed !== false && r.t > 0 && r.t >= r.ms && n < r.lines.length) {
+        r.n = n + 1; r.armed = false; this.last = now;
+        say(r.lines[n]);
+        if (Script.asking) Script.reask();
+        return true;
+      }
+    }
+    return false;
+  },
+};
+
+function direct(dt, now) {
+  if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
+  Reactions.update(dt);
+  if (pending) return;
   if (P.tracker) {
     const lost = now - P.lastSeen > CFG.LOST_MS;
     if (lost && !Script.lostSaid) { Script.lostSaid = true; say(['Tu es parti.']); return; }
     if (!lost && Script.lostSaid && P.face) {
       Script.lostSaid = false;
       say(Script.returns++ ? ['Te revoilà.'] : ['Tu reviens toujours.', 'Pourquoi ?']);
+      if (Script.asking) Script.reask();
       return;
     }
     if (lost) return;
@@ -505,9 +704,14 @@ function direct(now) {
   if (P.mirrored >= 4 && !Script.mirrorSaid) {
     Script.mirrorSaid = true; say(['Tu clignes. Je cligne.', 'Je peux te ressembler encore plus, si tu veux.']); return;
   }
-  if (now - lastSpoke > CFG.SILENCE_MS && Script.step < Script.musings.length) {
-    say(Script.musings[Script.step++]());
+  const h = Script.heard;
+  if (h) {
+    Script.heard = null;
+    if (now - h.at < 6000) { Script.gesture(h.g); return; }
   }
+  if (Reactions.fire(now)) return;
+  if (Script.asking) { Script.wait(now); return; }
+  if (now - lastSpoke > CFG.SILENCE_MS) Script.next();
 }
 
 // ---------- entrées
@@ -525,7 +729,12 @@ function renderDebug() {
     `perdu à   ${P.lostClose.toFixed(3)} (objectif si > ${(wakeAt() * CFG.LENS_RATIO).toFixed(3)})\n` +
     `netteté   ${P.sharp.toFixed(3)} / habituelle ${P.sharpBase.toFixed(3)} (flou si < ${(P.sharpBase * CFG.LENS_BLUR).toFixed(3)})\n` +
     `maintien  ${Math.round(P.hold)} / ${CFG.WAKE_HOLD_MS} ms\n` +
-    `lumière   ${P.light.toFixed(2)}\n` +
+    `lumière   pièce ${P.light.toFixed(2)}  visage ${P.faceLight.toFixed(2)} (il faut > ${CFG.FACE_LIGHT})\n` +
+    `yeux      ${ex('eyeBlinkLeft') < 0.35 && ex('eyeBlinkRight') < 0.35 ? 'ouverts' : 'fermés'}\n` +
+    `tête      lacet ${P.yaw.toFixed(2)}  tangage ${P.pitch.toFixed(2)}  roulis ${P.roll.toFixed(2)}\n` +
+    `geste     ${P.lastGesture || '—'}\n` +
+    `bouche    ${ex('jawOpen').toFixed(2)}  sourire ${((ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2).toFixed(2)}\n` +
+    `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}\n` +
     `imitation ${P.mirrored}`;
 }
 
@@ -549,6 +758,8 @@ addEventListener('keydown', e => {
   unlockAudio();
   if (e.key === 'w' || e.key === 'W') wake();
   if (e.key === 'd' || e.key === 'D') toggleDebug();
+  if (e.key === 'o' || e.key === 'O') onGesture('oui'); // test sur ordinateur
+  if (e.key === 'n' || e.key === 'N') onGesture('non');
 });
 addEventListener('resize', resize);
 
@@ -556,7 +767,7 @@ addEventListener('resize', resize);
 let last = performance.now(), frameN = 0;
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now; frameN++;
-  track(now, frameN); checkWake(dt, now); update(dt, now); direct(now); draw();
+  track(now, frameN); checkWake(dt, now); update(dt, now); direct(dt, now); draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   requestAnimationFrame(loop);
 }
