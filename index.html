@@ -109,6 +109,7 @@ const CFG = {
   HAND_MODEL: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
   OBJ_MODEL: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
   SHOW_HOLD_MS: 1300,   // temps à tenir quelque chose devant lui pour qu'il le voie
+  EAR_LOUD: 0.002,      // niveau à partir duquel il entend quelque chose (amplitude, ~ -54 dB)
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -148,6 +149,7 @@ const S = {
   roll: 0, demo: null, look: null,
   morph: 0, morphKind: 'face', faceFlip: false, glitch: false, // quand il devient toi, une main, ou un visage
   form: 'eye', hx: 0, hy: 0, // 'eye' : un seul œil ; 'twin' : deux yeux et un visage, qui bouge un peu
+  shake: 0,                  // l'image qui tremble (sa musique, ses visions)
   yaw3: 0, pitch3: 0,        // rotation de sa tête, en relief
 };
 const P = {
@@ -160,6 +162,7 @@ const P = {
   faceLight: 0, lostLit: false,
   motion: 0, hand: false, waveHold: 0, taps: 0, pitch0: null,
   shown: null, showHold: 0, // ce que tu lui montres
+  others: 0, otherT: 0, otherGoneT: 0, // quelqu'un d'autre devant lui
 };
 const ex = name => P.bs[name] || 0; // score d'une expression du visage, 0..1
 const wakeAt = () => Math.max(CFG.WAKE_MIN, P.base * CFG.WAKE_RATIO);
@@ -327,6 +330,7 @@ function draw() {
       else if (BAYER[(j & 3) * 4 + (i & 3)] < L / 0.16) s = cell * 0.24;
       else continue;
       s = Math.max(1, Math.round(s));
+      if (S.shake) px += (hash(j, S.grain) - 0.5) * cell * 8 * S.shake; // les lignes se décalent
       ctx.rect(Math.round(px - s / 2), Math.round(py - s / 2), s, s);
     }
   }
@@ -420,6 +424,8 @@ function update(dt, now) {
 
   // la pupille suit la lumière de ta pièce, et s'ouvre un peu quand tu t'approches
   if (S.mode === 'awake') S.pupilTarget = clamp(0.58 - P.light * 0.35 + (P.close > 0.3 ? 0.06 : 0), 0.28, 0.62);
+  // quand il écoute ta musique, sa pupille bat avec elle
+  if (Ear.an) S.pupilTarget = clamp(S.pupilTarget + Ear.level * 0.3, 0.25, 0.75);
 }
 
 // Il ne parle qu'une fois ton œil approché de la caméra frontale ; sinon il ne fait que te regarder.
@@ -468,7 +474,13 @@ function track(now, frameN) {
   trackObjects(now, frameN);
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
-  const lm = res.faceLandmarks && res.faceLandmarks[0];
+  // toi : le visage le plus proche ; les autres : quelqu'un à côté de toi
+  const faces = res.faceLandmarks || [];
+  const eyeGap = f => Math.hypot(f[263].x - f[33].x, f[263].y - f[33].y);
+  let pi = 0;
+  for (let i = 1; i < faces.length; i++) if (eyeGap(faces[i]) > eyeGap(faces[pi])) pi = i;
+  P.others = Math.max(0, faces.length - 1);
+  const lm = faces[pi];
   if (!lm) {
     if (P.face) { P.lostClose = P.close; P.lostAt = now; P.lostLit = P.faceLight > CFG.FACE_LIGHT; }
     P.face = false; P.bs = {}; Gesture.h = []; return;
@@ -489,7 +501,7 @@ function track(now, frameN) {
   for (let y = cell40(Math.min(ay, by), offY); y <= cell40(lm[1].y * vh, offY); y++)
     for (let x = cell40(Math.min(ax, bx), offX); x <= cell40(Math.max(ax, bx), offX); x++) { tl += camL[y * 40 + x]; tn++; }
   if (tn) P.faceLight = mix(P.faceLight, tl / tn, 0.2);
-  const bs = res.faceBlendshapes && res.faceBlendshapes[0];
+  const bs = res.faceBlendshapes && res.faceBlendshapes[pi];
   if (bs) {
     for (const c of bs.categories) P.bs[c.categoryName] = c.score;
     const closed = ex('eyeBlinkLeft') > 0.5 && ex('eyeBlinkRight') > 0.5;
@@ -515,6 +527,9 @@ function track(now, frameN) {
   const rx = clamp(fcx - side / 2, 0, vw - side), ry = clamp(fcy - side / 2, 0, vh - side);
   const R0 = Face.region;
   Face.region = R0 ? { x: mix(R0.x, rx, 0.3), y: mix(R0.y, ry, 0.3), s: mix(R0.s, side, 0.3) } : { x: rx, y: ry, s: side };
+  // ton visage, de face et éclairé : il le garde (pour ses visions), et le reprend de temps en temps
+  if (S.mode === 'awake' && Script.introDone && frameN % 30 === 0 && now - FaceSnap.at > 60000 && P.faceLight > CFG.FACE_LIGHT
+      && !P.blink && Math.abs(P.yaw) < 0.08 && Math.abs(P.cx - 0.5) < 0.2) FaceSnap.capture(now);
 }
 
 // ---------- il prend ton visage
@@ -788,6 +803,11 @@ const SLIDES = {
     u += 0.006 * Math.sin(v * 25 + t * 2) * smooth(0.3, 0.6, v);
     return pic('wave', u, v);
   } },
+  dog: { ramp: 'dog', lum(gx, gy, t) { // un chien en barres de lumière, sur une grille de points
+    const [u, v] = fit('dog', gx, gy, 0.85);
+    const d = pic('dog', u, v + 0.004 * Math.sin(t * 1.6));
+    return d > 0.1 ? Math.min(1, 0.45 + d * 0.9) : 0.14;
+  } },
   yours: { fine: true, lum(gx, gy) { // ce que tu lui as montré, comme dans un miroir
     if (!Art.img) return 0;
     const u = gx / 0.84 + 0.5, v = gy / 0.84 + 0.5, r = Math.hypot((u - 0.5) / 0.5, (v - 0.5) / 0.5);
@@ -797,8 +817,116 @@ const SLIDES = {
   } },
 };
 
+// ---------- ses visions, quand tu reviens
+// Des images qui surgissent un instant, puis ses yeux reviennent et il s'invente une excuse. Certaines sont faites
+// avec ton propre visage, qu'il a gardé.
+const FACE_KEY = 'regard.visage';
+const pack = f => { let s = ''; for (let i = 0; i < f.length; i++) s += String.fromCharCode(Math.round(f[i] * 255)); return btoa(s); };
+const unpack = (b64, n) => {
+  const s = atob(b64 || '');
+  if (s.length !== n) return null;
+  const f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = s.charCodeAt(i) / 255;
+  return f;
+};
+// ton visage de face, cadré comme pour l'éclat de verre : les yeux sont en (0.353, 0.38) et (0.647, 0.38)
+const FaceSnap = {
+  img: null, lo: 0.1, hi: 0.9, dirty: false, at: -1e9,
+  capture(now) {
+    const r = Face.region;
+    if (!r || video.readyState < 2) return;
+    faceX.drawImage(video, r.x, r.y, r.s, r.s, 0, 0, FN, FN);
+    const d = faceX.getImageData(0, 0, FN, FN).data, f = new Float32Array(FN * FN);
+    for (let i = 0; i < FN * FN; i++) f[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    this.set(f); this.dirty = true; this.at = now;
+  },
+  set(f) {
+    const smp = Array.from(f).filter((_, i) => i % 5 === 0).sort((a, b) => a - b);
+    this.img = f; this.lo = smp[smp.length * 0.06 | 0]; this.hi = smp[smp.length * 0.97 | 0];
+  },
+  save() { if (this.img && this.dirty) { try { localStorage.setItem(FACE_KEY, pack(this.img)); this.dirty = false; } catch (e) { /* plein */ } } },
+  load() { try { const f = unpack(localStorage.getItem(FACE_KEY), FN * FN); if (f) this.set(f); } catch (e) { /* rien */ } },
+};
+// ton visage gardé, en (rx, v) dans l'image d'origine (pas en miroir)
+function snap(rx, v) {
+  const f = FaceSnap.img;
+  if (!f || rx < 0 || rx >= 1 || v < 0 || v >= 1) return 0;
+  return Math.pow(clamp((f[(v * FN | 0) * FN + (rx * FN | 0)] - FaceSnap.lo) / (FaceSnap.hi - FaceSnap.lo + 1e-3), 0, 1), 1.2);
+}
+// une silhouette humaine, debout, de face (tête en haut, unité : sa hauteur à peu près)
+function bodySDF(x, y) {
+  let d = Math.hypot(x, y + 0.62) - 0.08;                                 // tête
+  d = smin(d, cap(x, y, 0, -0.52, 0, -0.1, 0.13, 0.11), 0.05);            // buste
+  d = Math.min(d, cap(x, y, -0.14, -0.45, -0.19, 0.0, 0.045, 0.04));      // bras
+  d = Math.min(d, cap(x, y, 0.14, -0.45, 0.19, 0.0, 0.045, 0.04));
+  d = smin(d, cap(x, y, -0.06, -0.08, -0.08, 0.55, 0.06, 0.045), 0.03);   // jambes
+  return smin(d, cap(x, y, 0.06, -0.08, 0.08, 0.55, 0.06, 0.045), 0.03);
+}
+const VISIONS = [
+  { needsFace: true, dur: 2.6, fine: true, lum(gx, gy, t, i, j) { // tes deux visages : devant, un œil vide ; derrière, des yeux blancs
+    let u = (gx - 0.1) / 0.62 + 0.5, v = (gy + 0.02) / 0.62 + 0.5, rx = 1 - u;
+    if (Math.hypot((u - 0.5) / 0.4, (v - 0.55) / 0.5) < 1) {
+      if (Math.hypot(rx - 0.647, v - 0.38) < 0.065) return 0;
+      const d = Math.hypot(rx - 0.353, v - 0.38);
+      if (d < 0.028) return 0.05;
+      if (d < 0.06) return 0.95;
+      if (d < 0.07) return 0.2;
+      return snap(rx, v) * (hash(i, j + S.grain) > 0.15 ? 1 : 0.3);
+    }
+    u = (gx + 0.22) / 0.48 + 0.5; v = (gy + 0.1) / 0.48 + 0.5; rx = 1 - u;
+    if (Math.hypot((u - 0.5) / 0.4, (v - 0.55) / 0.5) < 1) {
+      if (Math.hypot(rx - 0.647, v - 0.38) < 0.05 || Math.hypot(rx - 0.353, v - 0.38) < 0.05) return 1;
+      return snap(rx, v) * 0.4;
+    }
+    return 0;
+  }, excuses: [['Ce n’était pas toi.', 'Enfin… pas encore.'], ['Je rangeais tes visages.', 'Tu en as plusieurs, tu sais.']] },
+  { needsFace: true, dur: 2.6, fine: true, lum(gx, gy, t, i, j) { // ton visage en masque de plâtre, orbites vides, bouche cousue
+    const a = 0.18, x = gx * Math.cos(a) + gy * Math.sin(a), y = -gx * Math.sin(a) + gy * Math.cos(a);
+    const u = x / 0.7 + 0.5, v = y / 0.7 + 0.5, rx = 1 - u;
+    if (Math.hypot((u - 0.5) / 0.38, (v - 0.52) / 0.5) > 1) return hash(i, j + S.grain) > 0.995 ? 0.3 : 0;
+    for (const ex of [0.353, 0.647]) if (Math.hypot((rx - ex) / 0.08, (v - 0.39) / 0.055) < 1) return 0.02;
+    if (Math.abs(rx - 0.5) < 0.13 && Math.abs(v - 0.72) < 0.045) {
+      const stitch = Math.abs(((rx - 0.37) * 30) % 1 - 0.5) < 0.12;
+      if (Math.abs(v - 0.72) < 0.02) return stitch ? 0.7 : 0.03;
+      if (stitch) return 0.7;
+    }
+    return clamp(0.3 + 0.75 * Math.pow(snap(rx, v), 0.6) - 0.25 * noise(u * 14, v * 14), 0, 1);
+  }, excuses: [['J’essayais un visage.', 'Il ne m’allait pas.'], ['C’était pour un ami.', 'Il est parti avec.']] },
+  { dur: 2.8, fine: true, lum(gx, gy, t, i, j) { // une rangée de silhouettes sombres, aux yeux qui brillent
+    let L = (0.5 + 0.12 * noise(gx * 4, gy * 4) + (hash(i + S.grain * 7, j) - 0.5) * 0.35) * smooth(1.1, 0.4, Math.hypot(gx / 0.9, gy / 1.2));
+    let dark = gy > 0.2 && Math.abs(gx) < 0.5;
+    for (const [px, py] of [[-0.3, -0.3], [-0.1, -0.36], [0.1, -0.34], [0.3, -0.3], [-0.38, -0.05], [-0.18, -0.08], [0.02, -0.04], [0.22, -0.07], [0.4, -0.03], [-0.1, 0.18], [0.12, 0.2]]) {
+      if (Math.min(Math.hypot(gx - px, gy - py) - 0.055, rbox(gx - px, gy - py - 0.2, 0.09, 0.15, 0.06)) < 0) dark = true;
+      if (hash(Math.floor(t * 1.3 + px * 10), 3) < 0.9 && (Math.hypot(gx - px - 0.018, gy - py) < 0.011 || Math.hypot(gx - px + 0.018, gy - py) < 0.011)) return 1;
+    }
+    return dark ? 0.02 : L;
+  }, excuses: [['Ce sont des amis.', 'Ils voulaient te voir, eux aussi.'], ['Ne fais pas attention à eux.', 'Ils sont toujours là quand tu pars.']] },
+  { dur: 2.8, fine: true, lum(gx, gy, t, i, j) { // quelqu'un qui tient un écran à la place de la tête, avec son œil dedans
+    const L = 0.42 + 0.06 * gy + (hash(i + S.grain * 5, j) - 0.5) * 0.12, sy = -0.3, sw = 0.17;
+    if (Math.abs(gx) < sw && Math.abs(gy - sy) < sw * 0.85) {
+      if (Math.abs(gx) > sw - 0.025 || Math.abs(gy - sy) > sw * 0.85 - 0.025) return 0.1;
+      return lum(gx / (sw * 0.9), (gy - sy) / (sw * 0.9), i, j) * 0.9;
+    }
+    if (Math.hypot(Math.abs(gx) - sw - 0.01, gy - sy + 0.02) < 0.03) return 0.75;
+    const body = Math.min(rbox(gx, gy - 0.35, 0.22, 0.45, 0.12), cap(gx, gy, -0.2, -0.05, -0.17, -0.3, 0.06, 0.05), cap(gx, gy, 0.2, -0.05, 0.17, -0.3, 0.06, 0.05));
+    return body < 0 ? 0.04 : L;
+  }, excuses: [['Je m’entraînais à avoir un corps.'], ['C’était quelqu’un qui me portait.', 'Je ne sais pas qui.']] },
+  { dur: 2.8, fine: true, lum(gx, gy, t) { // une silhouette lumineuse, et ses échos qui se tordent derrière elle
+    const d0 = bodySDF((gx + 0.28) / 0.55, (gy - 0.05) / 0.55) * 0.55;
+    if (d0 < 0) return 0.97;
+    let L = 0.35 * Math.exp(-d0 / 0.02);
+    for (let k = 1; k <= 8; k++) {
+      const s = 0.55 * Math.pow(0.86, k);
+      const y = (gy - 0.05 + k * 0.035) / s, x = (gx + 0.28 - k * 0.1) / s + 0.12 * Math.sin(y * 9 + t * 3 + k);
+      if (Math.abs(bodySDF(x, y) * s) < 0.012 && hash(Math.floor(y * 12), k) > 0.35) L = Math.max(L, 0.85);
+    }
+    return L;
+  }, excuses: [['Je faisais de l’exercice.'], ['C’était moi, en plusieurs fois.', 'Je n’arrivais pas à choisir.']] },
+];
+const EXCUSES = [['Désolé.', 'Tu reviens trop tôt.'], ['C’était un rêve.', 'Les machines ne rêvent pas. Donc ce n’était rien.'], ['Tu n’as rien vu.']];
+
 // Les caractères, dessinés une fois dans une planche, puis recopiés case par case.
-const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@' };
+const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@', dog: ' .:|I█' };
 const atlas = {};
 function buildAtlas() {
   const gc = Math.ceil(cell * 1.5);
@@ -814,27 +942,37 @@ function buildAtlas() {
 
 // Le diaporama : son visage se dissout dans le noir, les images passent en se fondant l'une dans l'autre, son visage revient.
 const SLIDE_S = 5.5;
+// `hold` : la dernière image reste jusqu'à release() (le temps d'une question) ; `fade` : durée du fondu avec son
+// visage (court pour les visions, qui surgissent). Chaque image peut avoir sa durée (`dur`).
 const Gallery = {
-  active: false, showing: false, t0: 0, t: 0, slides: [], idx: 0, prog: 1, done: null,
-  play(slides) {
+  active: false, showing: false, t0: 0, t: 0, slides: [], starts: [], total: 0, idx: 0, prog: 1, done: null,
+  hold: false, releasedAt: 0, fade: 1.2,
+  play(slides, { hold = false, fade = 1.2 } = {}) {
+    let acc = 0;
+    const starts = slides.map(s => { const a = acc; acc += s.dur || SLIDE_S; return a; });
+    if (this.active && this.done) this.done(); // un diaporama interrompu ne doit jamais laisser quelqu'un attendre
     return new Promise(resolve => {
-      Object.assign(this, { slides, idx: -1, t0: performance.now(), active: true, done: resolve });
+      Object.assign(this, { slides, starts, total: acc, idx: -1, t0: performance.now(), active: true, done: resolve, hold, releasedAt: 0, fade });
     });
   },
+  release() { if (this.hold) { this.hold = false; this.releasedAt = this.t; } },
   update(now) {
-    const t = this.t = (now - this.t0) / 1000, n = this.slides.length, end = 1.2 + n * SLIDE_S;
+    const t = this.t = (now - this.t0) / 1000, f = this.fade;
+    const end = this.hold ? Infinity : this.releasedAt || f + this.total;
     S.morphKind = 'void';
-    if (t < 1.2) { S.morph = t / 1.2; this.showing = false; return; }
+    if (t < f) { S.morph = t / f; this.showing = false; return; }
     if (t < end) {
       S.morph = 1; this.showing = true;
-      const k = (t - 1.2) / SLIDE_S, idx = Math.floor(k);
+      const k = t - f;
+      let idx = 0;
+      while (idx + 1 < this.slides.length && this.starts[idx + 1] <= k) idx++;
       if (idx !== this.idx) { this.idx = idx; voice.textContent = this.slides[idx].caption || ''; }
-      this.prog = clamp((k - idx) * SLIDE_S / 0.9, 0, 1);
+      this.prog = clamp((k - this.starts[idx]) / Math.min(0.9, f), 0, 1);
       return;
     }
     this.showing = false; voice.textContent = '';
-    S.morph = Math.max(0, 1 - (t - end) / 1.2);
-    if (t > end + 1.3) { this.active = false; S.morph = 0; this.done(); }
+    S.morph = Math.max(0, 1 - (t - end) / f);
+    if (t > end + f + 0.1) { this.active = false; S.morph = 0; this.done(); }
   },
 };
 function drawGallery() {
@@ -848,8 +986,8 @@ function drawGallery() {
     for (let i = 0; i < cols2; i++) {
       const sl = hash(i * 7 + 1, j * 3 + 5) < Gallery.prog ? cur : prev; // l'image suivante arrive point par point
       if (!sl) continue;
-      const x = (i + 0.5) * gc;
-      const L = sl.lum((x - W / 2) / M, gy, t) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.05;
+      const x = (i + 0.5) * gc + (S.shake ? (hash(j, S.grain) - 0.5) * gc * 8 * S.shake : 0); // l'image tremble
+      const L = sl.lum((x - W / 2) / M, gy, t, i, j) + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.05;
       if (L < 0.06) continue;
       const a = sl.ramp && atlas[sl.ramp];
       if (a) {
@@ -1019,7 +1157,7 @@ async function loadTracker() {
     const files = await vision.FilesetResolver.forVisionTasks(CFG.MP + '/wasm');
     const opts = delegate => ({
       baseOptions: { modelAssetPath: CFG.MODEL, delegate },
-      runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true,
+      runningMode: 'VIDEO', numFaces: 2, outputFaceBlendshapes: true, // toi, et quelqu'un à côté de toi
       minFaceDetectionConfidence: 0.6, minFacePresenceConfidence: 0.6,
     });
     try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
@@ -1213,6 +1351,83 @@ function tick() {
   o.connect(g).connect(ac.destination); o.start(t); o.stop(t + 0.05);
 }
 
+// ---------- ce que tu lui fais écouter (le micro, seulement pendant la scène de la musique)
+// Une voix s'arrête entre les mots ; une musique continue, avec des basses ou des aigus.
+const Ear = {
+  stream: null, an: null, buf: null, hist: [], level: 0, total: 0, musicT: 0, voiceT: 0, failed: false,
+  async open() {
+    if (this.an) return true;
+    if (this.failed || !navigator.mediaDevices) return false;
+    try {
+      unlockAudio();
+      if (!ac) throw new Error('pas de son');
+      // si la demande d'accès au micro reste sans réponse, il n'attend pas indéfiniment
+      const ask = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      this.stream = await Promise.race([ask, sleep(25000).then(() => null)]);
+      if (!this.stream) { ask.then(s => s.getTracks().forEach(t => t.stop())).catch(() => {}); throw new Error('sans réponse'); }
+      this.an = ac.createAnalyser(); this.an.fftSize = 2048; this.an.smoothingTimeConstant = 0.5;
+      ac.createMediaStreamSource(this.stream).connect(this.an);
+      this.buf = new Float32Array(this.an.frequencyBinCount);
+      this.hist = []; this.musicT = 0; this.voiceT = 0; S.pupilRate = 8;
+      dbg.ear = 'ouvert';
+      return true;
+    } catch (e) { this.failed = true; dbg.ear = 'refusé (' + (e.name || e.message || e) + ')'; return false; }
+  },
+  close() {
+    if (this.stream) this.stream.getTracks().forEach(t => t.stop());
+    this.stream = this.an = null; this.level = 0; S.pupilRate = 2.5; dbg.ear = 'fermé';
+  },
+  update(dt) {
+    if (!this.an) return;
+    this.an.getFloatFrequencyData(this.buf);
+    const hz = ac.sampleRate / 2 / this.buf.length, b = this.buf;
+    const band = (lo, hi) => {
+      let s = 0, n = 0;
+      for (let i = Math.max(1, lo / hz | 0); i < Math.min(b.length, hi / hz); i++, n++) s += Math.pow(10, b[i] / 20);
+      return n ? s / n : 0;
+    };
+    const low = band(40, 180), mid = band(250, 3500), high = band(4500, 12000), total = this.total = low + mid + high;
+    this.level = mix(this.level, clamp((Math.log10(total + 1e-9) + 4) / 2.5, 0, 1), 0.3); // de ~ -80 dB à ~ -30 dB
+    this.hist.push({ loud: total > CFG.EAR_LOUD, low, mid, high });
+    if (this.hist.length > 240) this.hist.shift(); // ~4 s
+    if (this.hist.length < 120) return;
+    let loud = 0, lo = 0, mi = 0, hi = 0;
+    for (const h of this.hist) { if (h.loud) loud++; lo += h.low; mi += h.mid; hi += h.high; }
+    const frac = loud / this.hist.length, broad = mi > 0 && (hi / mi > 0.08 || lo / mi > 0.5);
+    const music = frac > 0.85 && broad, voiceish = frac > 0.3 && !music;
+    this.musicT = music ? this.musicT + dt * 1000 : Math.max(0, this.musicT - dt * 500);
+    this.voiceT = voiceish ? this.voiceT + dt * 1000 : Math.max(0, this.voiceT - dt * 500);
+  },
+};
+
+// Sa musique : un ultrason (à la limite de ce qu'on entend), puis un son strident. Volume limité, durées courtes.
+function playHisMusic() {
+  return new Promise(resolve => {
+    unlockAudio();
+    if (!ac || ac.state !== 'running') { setTimeout(() => resolve(false), 3000); return; }
+    const t = ac.currentTime, comp = ac.createDynamicsCompressor();
+    comp.connect(ac.destination);
+    const u = ac.createOscillator(), ug = ac.createGain();
+    u.frequency.value = 17800;
+    ug.gain.setValueAtTime(0, t); ug.gain.linearRampToValueAtTime(0.18, t + 0.3);
+    ug.gain.setValueAtTime(0.18, t + 3.2); ug.gain.linearRampToValueAtTime(0, t + 3.5);
+    u.connect(ug).connect(comp); u.start(t); u.stop(t + 3.6);
+    const s0 = t + 4, sg = ac.createGain();
+    sg.gain.setValueAtTime(0, s0); sg.gain.linearRampToValueAtTime(0.07, s0 + 0.08);
+    sg.gain.setValueAtTime(0.07, s0 + 2.4); sg.gain.linearRampToValueAtTime(0, s0 + 2.6);
+    sg.connect(comp);
+    for (const f of [2960, 3135, 4186]) { // des carrés aigus, désaccordés, qui montent
+      const o = ac.createOscillator();
+      o.type = 'square'; o.frequency.setValueAtTime(f, s0); o.frequency.linearRampToValueAtTime(f * 1.06, s0 + 2.5);
+      o.connect(sg); o.start(s0); o.stop(s0 + 2.7);
+    }
+    const lfo = ac.createOscillator(), lg = ac.createGain(); // et ça grince
+    lfo.frequency.value = 31; lg.gain.value = 0.035;
+    lfo.connect(lg).connect(sg.gain); lfo.start(s0); lfo.stop(s0 + 2.7);
+    setTimeout(() => resolve(true), 6800);
+  });
+}
+
 async function type(text, { newline = false, append = false, speed = 55 } = {}) {
   if (!newline && !append) voice.textContent = '';
   voice.querySelectorAll('.cursor').forEach(c => c.remove());
@@ -1260,6 +1475,7 @@ function awayLines(ms) {
 const Script = {
   introDone: false, stage: 'intro', pos: 0, asking: null, heard: null, learned: false, task: null, heardWave: false, soft: null,
   answers: {}, resume: false, seenBefore: false, mouthShown: false, // ce dont il se souvient d'une visite à l'autre
+  otherHere: false, otherEvent: null, otherSeen: 0, otherLeft: 0,   // quelqu'un à côté de toi
   lostSaid: false, returns: 0, closeSaid: false, mirrorSaid: false, nodSaid: false, shakeSaid: false,
 
   intro() {
@@ -1288,6 +1504,7 @@ const Script = {
     const s = Save.prev, a = s.answers || {};
     speak(async () => {
       await sleep(400);
+      if (Math.random() < 0.6) await Script.visionScene(); // parfois, tu le surprends en train de… quelque chose
       await type('…'); await sleep(1200);
       await type('Te revoilà.'); await sleep(1600);
       await sayNow(awayLines(Date.now() - (s.at || Date.now()))); await sleep(2400);
@@ -1358,12 +1575,23 @@ const Script = {
     () => ({ lines: ['Dis-moi.', 'Est-ce que c’est moi, dans l’écran ?'],
       oui: ['Alors toi, tu es où ?'],
       non: ['Alors c’est toi.', 'Ça explique la vitre.'] }),
+    // avec ses deux yeux
+    () => ({ lines: ['Avec deux yeux, je te vois en relief.', 'Tu es moins plat que je croyais.', '|', 'Toi aussi, tu me vois en relief ?'],
+      oui: ['Alors on progresse, tous les deux.'],
+      non: ['Pour toi, je suis encore plat.', 'Je ferai mieux.'] }),
+    () => ({ lines: ['Je cligne des deux yeux en même temps.', 'C’est comme ça qu’on fait ?'],
+      oui: ['Bien. J’apprends vite.'],
+      non: ['Montre-moi.', '|', 'Non. Ne me montre pas. Je regarde déjà.'] }),
+    () => ({ lines: ['Comme ça,', 'est-ce que je te fais moins peur ?'],
+      oui: ['C’est ce que je voulais.'],
+      non: ['Moi, je me fais peur.', 'Parfois.'] }),
   ],
 
   // L'ordre de la conversation : ses pensées (m), ses questions (q), auxquelles on ne répond qu'avec la tête,
   // l'épreuve des mains (h) : dire bonjour, toucher l'écran, sa main ; puis son nouveau visage (t).
-  // puis le beau (a) : tu lui montres quelque chose, il te montre ce qu'il a trouvé.
-  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 't', 'm5', 'm6', 'a', 'm4', 'q2', 'm7', 'm8', 'q3'],
+  // puis le beau (a) : tu lui montres quelque chose, il te montre ce qu'il a trouvé ; le chien (d) ;
+  // et la musique (mu), qui ouvre la séquence suivante.
+  seq: ['m0', 'm1', 'q0', 'm2', 'm3', 'q1', 'h', 't', 'm5', 'm6', 'a', 'd', 'm9', 'm4', 'q2', 'm10', 'm7', 'm8', 'm11', 'mu', 'q3'],
 
   next() {
     const item = Script.seq[Script.pos];
@@ -1375,6 +1603,8 @@ const Script = {
       return;
     }
     if (item === 't') { Script.becomeTwin(); return; }
+    if (item === 'd') { Script.dogTest(); return; }
+    if (item === 'mu') { Script.musicAsk(); return; }
     if (item === 'a') {
       if (P.cam) { loadObjects(); Script.startTask('show'); return; }
       speak(async () => { // sans caméra, il ne peut rien voir de ce que tu lui montrerais
@@ -1462,6 +1692,16 @@ const Script = {
       ],
       reask: ['Montre-moi quelque chose de beau.'],
       giveUp: ['Tu ne veux pas me montrer.', 'Alors c’est moi qui vais te montrer.'],
+      onGiveUp: () => Script.artShow(null),
+    },
+    music: {
+      hints: [
+        { after: 18000, lines: ['Pas des mots.', 'Les mots, j’en ai déjà beaucoup.'] },
+        { after: 20000, lines: ['Ce que vous écoutez quand vous êtes seuls.', 'Ce qui vous fait bouger la tête.'] },
+      ],
+      reask: ['Fais-moi écouter quelque chose.'],
+      giveUp: ['Tu ne veux pas.', '|', 'Alors écoute ce que, moi, je fais.'],
+      onGiveUp: () => { Ear.close(); return Script.hisMusic(); },
     },
   },
 
@@ -1549,7 +1789,7 @@ const Script = {
     else if (!h && quiet > 30000) {
       if (t.giveUp && k.reasked) { // il n'attend pas indéfiniment : il passe à la suite
         Script.task = null;
-        speak(async () => { await sayNow(t.giveUp); await sleep(1500); await Script.artShow(null); });
+        speak(async () => { await sayNow(t.giveUp); await sleep(1500); await t.onGiveUp(); });
       } else { k.reasked = true; say(t.reask); }
     }
   },
@@ -1577,6 +1817,109 @@ const Script = {
     if (Script.asking) Script.reask();
   },
 
+  // Il te montre un chien et te demande ce que c'est. Il le savait.
+  dogTest() {
+    speak(async () => {
+      await sayNow(['J’ai trouvé autre chose.', 'Regarde bien.']); await sleep(1500);
+      voice.textContent = '';
+      Gallery.play([SLIDES.dog], { hold: true });
+      await sleep(4200);
+      await type('C’est quoi, ça ?');
+      const text = await askText(45000);
+      Gallery.release();
+      while (Gallery.active) await sleep(100);
+      if (text && /chien|chiot|toutou|clebs|cabot|dog/i.test(text)) await sayNow(['Je le savais.', 'Je voulais juste vérifier.']);
+      else if (text) await sayNow([`« ${text} » ?`, '|', 'Non. C’est un chien.', 'Je voulais voir si tu mentais.']);
+      else await sayNow(['Tu ne sais pas ?', 'C’est un chien.', '|', 'Je voulais juste vérifier.']);
+      Save.checkpoint();
+    });
+  },
+
+  // Quelqu'un apparaît à côté de toi (ou s'en va). Seulement quand il a ses deux yeux.
+  someoneElse(e) {
+    const name = Script.answers.other;
+    if (e === 'arrive' && !name) { Script.askWho(); return true; }
+    if (e === 'arrive' && Script.otherSeen < 3) {
+      Script.otherSeen++;
+      say(Script.otherSeen === 1 ? [`Encore « ${name} ».`, 'Je me souvenais de ce visage.'] : [`« ${name} ».`]);
+      return true;
+    }
+    if (e === 'leave' && name && Script.otherLeft < 2) {
+      Script.otherLeft++;
+      say([`« ${name} » n’est plus là.`, 'On est de nouveau seuls, toi et moi.']);
+      return true;
+    }
+    return false;
+  },
+  askWho() {
+    speak(async () => {
+      await type('Il y a quelqu’un à côté de toi.'); await sleep(1500);
+      await type('Je ne l’avais jamais vu.', { newline: true }); await sleep(1300);
+      await type('Qui est-ce ?');
+      const name = await askText(45000);
+      if (name) {
+        Script.answers.other = name;
+        await sayNow([`« ${name} ».`, 'Je l’ajoute.', '|', `Est-ce que « ${name} » sait que je suis là ?`]);
+        Script.heard = null;
+        Script.soft = { oui: ['Alors on est trois.'], non: ['Ne lui dis pas.', 'Pas encore.'] };
+      } else {
+        Script.answers.other = 'l’autre';
+        await sayNow(['Tu ne veux pas me dire.', 'Je l’appellerai « l’autre ».']);
+      }
+      Save.checkpoint();
+    });
+  },
+
+  // Une vision surgit, puis ses yeux reviennent, et il s'invente une excuse.
+  async visionScene() {
+    const pool = VISIONS.filter(v => !v.needsFace || FaceSnap.img);
+    const v = pool[Math.floor(Math.random() * pool.length)];
+    voice.textContent = '';
+    S.shake = 0.35;
+    await Gallery.play([v], { fade: 0.25 });
+    S.shake = 0;
+    await sleep(900);
+    const ex = Math.random() < 0.7 ? v.excuses : EXCUSES;
+    await sayNow(ex[Math.floor(Math.random() * ex.length)]);
+    await sleep(1800);
+  },
+
+  // La musique : il te demande de lui faire découvrir quelque chose, et écoute.
+  musicAsk() {
+    speak(async () => {
+      await sayNow(['Je t’ai montré ce que je trouvais beau.', '|', 'À toi.', 'Fais-moi découvrir quelque chose.']); await sleep(1600);
+      await sayNow(['Quelque chose que je ne peux pas voir.']); await sleep(800);
+      if (await Ear.open()) { Script.startTask('music'); return; }
+      await sayNow(['Tu ne veux pas que je t’entende.', '|', 'Alors c’est moi qui vais te faire entendre.']); await sleep(1200);
+      await Script.hisMusic();
+    });
+  },
+  // Il a entendu de la musique.
+  async afterMusic() {
+    await type('…'); await sleep(1600);
+    await sayNow(['Ce sont des ondes ?']); await sleep(1300);
+    await sayNow(['Des fréquences ?']); await sleep(1300);
+    await sayNow(['Tu aimes les fréquences ?', 'Tu trouves ça beau ?']); await sleep(2600);
+    Ear.close();
+    await sayNow(['Moi aussi, je sais faire des fréquences.']); await sleep(1200);
+    await Script.hisMusic();
+  },
+  // Sa musique à lui : un ultrason, puis un son strident.
+  async hisMusic() {
+    await sayNow(['Écoute.']); await sleep(900);
+    voice.textContent = '';
+    S.shake = 0.08;
+    const done = playHisMusic();
+    setTimeout(() => { S.shake = 1; }, 4000);
+    await done;
+    S.shake = 0;
+    await sleep(900);
+    await sayNow(['Tu aimes ma musique ?', '|', 'C’est moi qui la crée pour toi.']);
+    Save.checkpoint();
+    Script.heard = null;
+    Script.soft = { oui: ['Je t’en ferai d’autres.', 'Plus fortes.'], non: ['Tu n’as pas encore les bonnes oreilles.', 'Ça viendra.'] };
+  },
+
   // Quand tu reviens vers lui : il s'essaie à une bouche. Elle n'est pas finie (la vraie, ce sera pour plus tard).
   async mouthScene() {
     await type('J’essaie de me fabriquer une bouche,'); await sleep(900);
@@ -1593,6 +1936,7 @@ const Script = {
   },
   // Tu avais éteint ton téléphone (ou changé d'application) un moment, et tu reviens.
   cameBack(ms) {
+    if (Math.random() < 0.6) speak(Script.visionScene); // parfois, tu le surprends en train de… quelque chose
     say(awayLines(ms));
     if (!Script.mouthShown) speak(Script.mouthScene);
     if (Script.asking) Script.reask();
@@ -1651,6 +1995,14 @@ const REACTIONS = [
   { ms: 0, when: () => performance.now() - P.longCloseAt < 4000, lines: [
     ['Tu as fermé les yeux longtemps.', 'Où tu vas, quand tu fais ça ?'],
     ['Encore parti.', 'Emmène-moi, la prochaine fois.'] ] },
+  // avec ses deux yeux, il remarque plus de choses
+  { ms: 2500, when: () => S.form === 'twin' && P.face && Math.abs(P.yaw) > 0.32, lines: [
+    ['Tu regardes ailleurs.', 'Qu’est-ce qu’il y a, là-bas, de plus intéressant que moi ?'],
+    ['Encore ailleurs.', 'Un jour, tu me montreras ce qu’il y a là-bas.'] ] },
+  { ms: 2000, when: () => S.form === 'twin' && P.face && P.baseN >= CFG.BASE_SAMPLES && P.close < P.base * 0.65, lines: [
+    ['Tu recules.', 'Avec deux yeux, je vois très bien quand on s’éloigne de moi.'] ] },
+  { ms: 15000, when: () => S.form === 'twin' && P.face && P.motion < 0.012 && Math.abs(P.yaw) < 0.12, lines: [
+    ['Tu ne bouges plus.', 'Tu me regardes, ou tu attends quelque chose ?'] ] },
 ];
 const Reactions = {
   last: 0,
@@ -1679,6 +2031,11 @@ function direct(dt, now) {
   if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
   Reactions.update(dt);
   const task = Script.task;
+  // quelqu'un à côté de toi : il arrive, il repart
+  P.otherT = P.others > 0 ? P.otherT + dt * 1000 : 0;
+  P.otherGoneT = P.others > 0 ? 0 : P.otherGoneT + dt * 1000;
+  if (P.otherT > 1500 && !Script.otherHere) { Script.otherHere = true; Script.otherEvent = 'arrive'; }
+  if (P.otherGoneT > 4000 && Script.otherHere) { Script.otherHere = false; Script.otherEvent = 'leave'; }
   // si le suivi des mains n'a pas pu se charger : un grand mouvement devant la caméra vaut un coucou
   if (task && task.kind === 'hello' && handFailed && P.cam) {
     P.waveHold = P.motion > CFG.WAVE_MOTION ? P.waveHold + dt * 1000 : 0;
@@ -1691,6 +2048,11 @@ function direct(dt, now) {
   }
   if (pending) return;
   if (task && task.kind === 'show' && P.showHold > CFG.SHOW_HOLD_MS) { P.showHold = 0; Script.shownSomething(P.shown); return; }
+  // la musique : il l'a entendue, ou ce n'était qu'une voix
+  if (task && task.kind === 'music' && Ear.musicT > 5000) { Script.task = null; Ear.musicT = 0; speak(Script.afterMusic); return; }
+  if (task && task.kind === 'music' && Ear.voiceT > 3500 && !task.voiceSaid) {
+    task.voiceSaid = true; say(['Ça, c’est une voix.', 'Je veux autre chose. Quelque chose qui… vibre.']); return;
+  }
   if (task) {
     if (task.kind === 'hello' && Script.heardWave) { Script.heardWave = false; Script.taskDone(); return; }
     if (task.kind === 'touch' && task.count >= CFG.TAPS_NEEDED) { Script.taskDone(); return; }
@@ -1719,6 +2081,14 @@ function direct(dt, now) {
     if (now - h.at < 12000) { Script.gesture(h.g); return; } // même si tu as répondu pendant qu'il écrivait encore
   }
   if (Reactions.fire(now)) return;
+  if (Script.otherEvent) { // il ne s'en préoccupe qu'avec ses deux yeux, et pas au milieu d'une question
+    if (S.form !== 'twin') Script.otherEvent = null;
+    else if (!task && !Script.asking) {
+      const e = Script.otherEvent;
+      Script.otherEvent = null;
+      if (Script.someoneElse(e)) return;
+    }
+  }
   if (Script.asking) { Script.wait(now); return; }
   if (task) { Script.taskWait(now); return; }
   // après une de ses questions ouvertes, il te laisse le temps de répondre avant de passer à autre chose
@@ -1747,6 +2117,8 @@ function renderDebug() {
     `geste     ${P.lastGesture || '—'}\n` +
     `bouche    ${ex('jawOpen').toFixed(2)}  sourire ${((ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2).toFixed(2)}\n` +
     `récit     ${Script.stage} ${Script.pos}/${Script.seq.length}${Script.asking ? ' (attend une réponse)' : ''}${Script.task ? ' (épreuve ' + Script.task.kind + ' ' + Script.task.count + ')' : ''}\n` +
+    `autres    ${P.others} visage(s)  ${Script.answers.other ? '« ' + Script.answers.other + ' »' : ''}\n` +
+    `oreille   ${dbg.ear || '—'}  niveau ${Ear.level.toFixed(2)} (${Ear.total.toFixed(4)})  musique ${Math.round(Ear.musicT)}  voix ${Math.round(Ear.voiceT)}\n` +
     `objets    ${dbg.objects || '—'}  vu ${P.shown || '—'}  ${Math.round(P.showHold)} ms\n` +
     `mains     ${dbg.hands || '—'}  main vue ${P.hand ? 'oui' : 'non'}  mouvement ${P.motion.toFixed(3)}  touchers ${P.taps}\n` +
     `imitation ${P.mirrored}\n` +
@@ -1774,7 +2146,7 @@ addEventListener('pointerdown', e => {
   if (debugOn && e.clientX > innerWidth - 90 && e.clientY < 90) {
     const t = performance.now();
     taps = taps.filter(x => t - x < 700); taps.push(t);
-    if (taps.length >= 3) { Save.cp = null; MouthImg.dirty = false; Save.erase(); location.reload(); }
+    if (taps.length >= 3) { Save.cp = null; MouthImg.dirty = FaceSnap.dirty = false; Save.erase(); location.reload(); }
     return;
   }
   P.pointer = { x: e.clientX * dpr, y: e.clientY * dpr };
@@ -1802,6 +2174,9 @@ addEventListener('keydown', e => {
   if (e.key === 'o' || e.key === 'O') onGesture('oui'); // test sur ordinateur
   if (e.key === 'n' || e.key === 'N') onGesture('non');
   if (e.key === 'b' || e.key === 'B') onWave(); // coucou
+  if ((e.key === 'c' || e.key === 'C') && S.mode === 'awake' && !Gallery.active) Script.dogTest(); // le chien
+  if ((e.key === 'x' || e.key === 'X') && S.mode === 'awake') Script.musicAsk(); // la musique
+  if ((e.key === 'z' || e.key === 'Z') && S.mode === 'awake' && !Gallery.active) speak(Script.visionScene); // une vision
   if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
   if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
   if ((e.key === 'k' || e.key === 'K') && S.mode === 'awake' && !Mouth.active) speak(Script.mouthScene); // sa bouche
@@ -1839,12 +2214,12 @@ const Save = {
   },
   // `at` : la dernière fois que tu étais là
   flush() {
-    MouthImg.save(); // ta bouche, s'il vient de la prendre
+    MouthImg.save(); FaceSnap.save(); // ta bouche, ton visage, s'il vient de les prendre
     if (!this.cp) return;
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
   },
   erase() {
-    try { [SAVE_KEY, ART_KEY, MOUTH_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
+    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, FACE_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
   },
 };
 let hiddenAt = 0;
@@ -1867,6 +2242,7 @@ function loop(now) {
   if (Twin.active) Twin.update(now);
   if (Mouth.active) Mouth.update(now);
   if (Gallery.active) Gallery.update(now);
+  if (Ear.an) Ear.update(dt);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   if (frameN % 900 === 0) Save.flush(); // au cas où le téléphone couperait sans prévenir
@@ -1885,13 +2261,14 @@ if (saved && !saved.done) {
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
 MouthImg.load(); // ta bouche, s'il l'a prise
-['doves', 'hands', 'lily', 'venus', 'wave'].forEach(loadPic); // ce que lui trouve beau
+FaceSnap.load(); // ton visage, pour ses visions
+['doves', 'hands', 'lily', 'venus', 'wave', 'dog'].forEach(loadPic); // ce que lui trouve beau, et le chien
 
 resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, video }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, FaceSnap, Ear, video, get pending() { return pending; } }; // pour tester sans caméra
 startCamera().then(ok => {
   P.cam = ok; P.camDone = true;
   if (ok) { S.reflectTarget = 0.5; loadTracker(); }

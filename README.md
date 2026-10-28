@@ -11,12 +11,13 @@ Un jeu mobile : un œil dans ton téléphone. On le retrouvera au fil de nombreu
 - Il demande comment on dit bonjour (coucou de la main devant la caméra), puis à quoi d’autre servent tes mains (tapoter l’écran : la trame ondule sous le doigt). Il tend alors sa main vers ton doigt, puis prend deux yeux et un visage.
 - Une fois qu’il a compris le oui / non, il te laisse le temps de répondre à certaines de ses phrases.
 - Le beau : il te demande de lui montrer quelque chose de beau (objet, fleur, personne), te demande ce que c’est (tu l’écris, il le garde), puis te montre ce que lui trouve beau.
-- Quand tu reviens vers lui, il te montre la bouche qu’il essaie de se fabriquer. Elle n’est pas finie.
+- Quand tu reviens vers lui, il te montre la bouche qu’il essaie de se fabriquer (prise sur la tienne), et parfois une vision étrange, avant de s’inventer une excuse.
+- Avec ses deux yeux : il remarque quelqu’un à côté de toi et te demande qui c’est, te montre un chien (« C’est quoi, ça ? »), puis te demande de lui faire écouter de la musique (micro) avant de jouer la sienne.
 
 ## Tester
 
 - Sans caméra : garde le doigt appuyé sur l'œil ~1,5 s.
-- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, D affiche le panneau de réglage.
+- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, D affiche le panneau de réglage.
 - Triple-tap en haut à gauche : panneau de réglage caché.
 - Pour jouer sans barre de navigateur : « Ajouter à l'écran d'accueil ».
 
