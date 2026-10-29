@@ -110,6 +110,9 @@ const CFG = {
   OBJ_MODEL: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
   SHOW_HOLD_MS: 1300,   // temps à tenir quelque chose devant lui pour qu'il le voie
   EAR_LOUD: 0.002,      // niveau à partir duquel il entend quelque chose (amplitude, ~ -54 dB)
+  VOICE_GATE: 0.012,    // séquence 3 : niveau minimal pour qu'il considère que tu parles (et 3× le bruit de ta pièce)
+  VOICE_MAX_S: 12,      // secondes de ta voix qu'il garde dans le téléphone
+  TRAIN_AWAY_MS: 20000, // absence qui lui suffit pour s'entraîner avec ta voix
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -320,6 +323,8 @@ function draw() {
       else if (S.morphKind === 'void') base = 0;
       else base = faceLum(x, y, j);
       let L = base + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
+      // les mots que tu dis, en pixels ; ils se défont en montant vers lui
+      if (Floaters.data) { const f = Floaters.at(i, j); if (f > 0.3 + 0.5 * hash(i * 13 + 5, j * 7 + 3)) L = Math.max(L, 0.92); }
       // sous ton doigt : les points s'écartent, et un anneau très faible s'étend, même dans le noir
       let px = x, py = y;
       for (const r of act) {
@@ -460,7 +465,7 @@ function wake() {
   S.jx = S.jy = 0; S.nextSaccade = 0;
   setTimeout(() => { S.pupilRate = 2.5; S.lidTarget = 1; }, 700);
   setTimeout(blink, 420); setTimeout(blink, 760);
-  setTimeout(() => { S.mode = 'awake'; Script.resume ? Script.welcomeBack() : Script.intro(); }, 1100);
+  setTimeout(() => { S.mode = 'awake'; Voix.active ? Voix.begin() : Script.resume ? Script.welcomeBack() : Script.intro(); }, 1100);
 }
 
 function onPlayerBlink() {
@@ -662,7 +667,21 @@ function twinLum(u, v, gi, gj) {
 // ---------- sa bouche, pas encore finie
 // Un sourire de dents dans le noir, la lèvre du bas éclairée. Il la construit devant toi : des dents manquent,
 // d'autres arrivent, et un côté n'est encore que des morceaux.
-const TEETH = 9;
+// Les dents : une arcade vue de face. Au milieu, les incisives, larges et claires ; vers les côtés, la courbe les rend
+// plus étroites, plus courtes, plus sombres. Le haut se perd sous la lèvre, et elles se fondent l'une dans l'autre.
+const TOOTH_W = [1, 0.78, 0.84, 0.72, 0.68, 0.62]; // de l'incisive centrale vers le fond
+const TOOTH_H = [1, 0.85, 0.96, 0.74, 0.68, 0.6];
+const TOOTH_SUM = TOOTH_W.reduce((a, b) => a + b, 0);
+// la dent sous `mu` (de -1 à 1 sur la largeur de la bouche) : son rang depuis le centre, sa position dans la dent
+// (0 du côté du centre, 1 vers le fond), et sa profondeur dans l'arcade
+function toothAt(mu) {
+  const a = Math.asin(clamp(mu, -0.999, 0.999)) / (Math.PI / 2);
+  let x = Math.abs(a) / 0.9 * TOOTH_SUM, k = 0;
+  while (k < TOOTH_W.length && x > TOOTH_W[k]) { x -= TOOTH_W[k]; k++; }
+  return k < TOOTH_W.length ? { k, side: a < 0 ? 0 : 1, lx: x / TOOTH_W[k], depth: Math.abs(a) } : null;
+}
+// une dent pas encore faite (sa bouche n'est pas finie)
+const toothMissing = (t, mu, salt) => Mouth.build < 1 && ((mu + 1) / 2 > Mouth.build || hash(t.k * 2 + t.side, salt) < 0.22);
 function mouthLum(u, v, gi, gj) {
   if (MouthImg.img) return mouthFromYou(u, v, gi, gj);
   let mu = u / 1.05;
@@ -672,26 +691,39 @@ function mouthLum(u, v, gi, gj) {
   if (env < 0.01) return 0;
   const open = Math.max(0, 1 - mu * mu), so = Math.sqrt(open);
   const curve = 0.16 * mu * mu - 0.1;                 // la ligne du sourire, qui remonte aux coins
-  const top = curve - 0.02, bot = curve + 0.36 * so + 0.02;
+  const gape = Lips.k > 0 ? mix(0.36, 0.06 + 0.4 * Lips.talk, Lips.k) : 0.36; // quand il parle, elle s'ouvre avec la voix
+  const top = curve - 0.02, bot = curve + gape * so + 0.02;
   // peau : dans l'ombre, sauf les lèvres et le menton
   let L = 0.1 + 0.08 * noise(mu * 4 + 9, mv * 4);
   L += 0.45 * Math.exp(-(((mv - bot - 0.06) / 0.05) ** 2)) * open;   // lèvre du bas, éclairée
   L += 0.25 * Math.exp(-(((mv - top + 0.07) / 0.035) ** 2)) * open;  // lèvre du haut, un fil de lumière
   L += 0.2 * smooth(bot + 0.15, bot + 0.45, mv) * Math.max(0, 1 - Math.abs(mu)); // menton
   if (open > 0 && mv > top && mv < bot) {
-    L = 0.03; // le noir de la bouche
-    // dents du haut
-    const k = Math.floor((mu + 1) / 2 * TEETH), xc = -1 + (k + 0.5) * 2 / TEETH;
-    const w = 0.85 / TEETH * (1 - 0.25 * Math.abs(xc)), tc = 0.16 * xc * xc - 0.1, th = 0.17 * (1 - 0.4 * Math.abs(xc));
-    if ((k + 0.5) / TEETH < Mouth.build && hash(k, 77) > 0.22 && Math.abs(mu - xc) < w && mv > tc && mv < tc + th) {
-      const r = Math.max(0, (mv - (tc + th - 0.04)) / 0.04), dx = Math.abs(mu - xc) / w;
-      if (dx * dx + r * r < 1) L = (0.92 - 0.35 * Math.abs(xc)) * (0.7 + 0.3 * smooth(tc, tc + 0.05, mv));
+    L = 0.03 + 0.05 * smooth(bot - 0.14, bot, mv) * so; // le noir de la bouche, la langue à peine
+    // dents du haut, accrochées sous la lèvre
+    const t = toothAt(mu);
+    if (t && !toothMissing(t, mu, 77)) {
+      const y0 = curve - 0.03, e = 2 * t.lx - 1;
+      const y1 = y0 + 0.22 * TOOTH_H[t.k] * (1 - 0.25 * t.depth) - (t.k === 2 ? 0.035 * Math.abs(e) : 0.012 * e * e); // la canine pointe
+      if (mv < y1) {
+        let c = 0.92 - 0.42 * t.depth;
+        c *= 0.6 + 0.4 * smooth(y0, y0 + 0.06, mv);                    // l'ombre de la lèvre
+        c *= 0.4 + 0.6 * smooth(0.02, 0.12, Math.min(t.lx, 1 - t.lx)); // un trait fin entre deux dents
+        c *= 1 - 0.2 * smooth(y1 - 0.025, y1, mv);                 // le bord, un peu translucide
+        if (t.k === 0) c += 0.07 * Math.exp(-(((t.lx - 0.4) / 0.15) ** 2)) * smooth(y0, y0 + 0.1, mv); // un reflet
+        L = c;
+      }
     }
-    // dents du bas, plus petites, à moitié cachées
-    const k2 = Math.floor((mu + 1) / 2 * (TEETH + 1)), xc2 = -1 + (k2 + 0.5) * 2 / (TEETH + 1);
-    const w2 = 0.8 / (TEETH + 1) * (1 - 0.3 * Math.abs(xc2)), lc = 0.16 * xc2 * xc2 - 0.1 + 0.25 * Math.sqrt(Math.max(0, 1 - xc2 * xc2));
-    if ((k2 + 0.5) / (TEETH + 1) < Mouth.build - 0.08 && hash(k2, 91) > 0.3 && Math.abs(mu - xc2) < w2 && mv > lc && mv < lc + 0.09) {
-      L = 0.62 - 0.3 * Math.abs(xc2);
+    // dents du bas : plus petites, plus sombres, elles suivent la mâchoire et la lèvre les cache à moitié
+    const b = L < 0.1 && toothAt(mu * 1.08);
+    if (b && !toothMissing(b, mu, 91)) {
+      const yb = bot + 0.01, e = 2 * b.lx - 1, yt = yb - 0.1 * TOOTH_H[b.k] * (1 - 0.3 * b.depth) + 0.008 * e * e;
+      if (mv > yt) {
+        let c = 0.62 - 0.35 * b.depth;
+        c *= 0.4 + 0.6 * smooth(0.02, 0.12, Math.min(b.lx, 1 - b.lx));
+        c *= 0.45 + 0.55 * smooth(yb, yb - 0.05, mv);
+        L = c;
+      }
     }
   }
   // la partie pas encore construite : des morceaux qui cherchent leur place
@@ -711,7 +743,14 @@ function mouthFromYou(u, v, gi, gj) {
     su += (hash(bx, by + S.grain) - 0.5) * 0.15;                       // un morceau qui cherche sa place
   }
   if (S.glitch) su += (hash(gj, S.grain) - 0.5) * 0.08;
-  const l = MouthImg.img[clamp(fv * MH | 0, 0, MH - 1) * MW + clamp((1 - su) * MW | 0, 0, MW - 1)];
+  // quand il parle : la lèvre du haut monte, celle du bas descend, et entre les deux, le noir
+  let sv = fv;
+  if (Lips.k > 0) {
+    const gap = 0.22 * Lips.talk * Lips.k;
+    if (Math.abs(fv - 0.5) < gap / 2) return 0.02;
+    sv += fv < 0.5 ? gap / 2 : -gap / 2;
+  }
+  const l = MouthImg.img[clamp(sv * MH | 0, 0, MH - 1) * MW + clamp((1 - su) * MW | 0, 0, MW - 1)];
   let c = clamp((l - MouthImg.lo) / (MouthImg.hi - MouthImg.lo + 1e-3), 0, 1);
   c = Math.pow(c * c * (3 - 2 * c), 1.5);
   const edge = smooth(1, 0.72, Math.hypot((fu - 0.5) / 0.5, (fv - 0.5) / 0.5));
@@ -1419,7 +1458,281 @@ function playHisMusic() {
   });
 }
 
-async function type(text, { newline = false, append = false, speed = 55 } = {}) {
+// ---------- ta voix, qu'il garde (séquence 3)
+// Pendant que tu parles, il enregistre des morceaux de ta voix (jamais pendant qu'il parle, lui).
+// Plus tard, il parle avec : des éclats de toi, découpés et ralentis, un par syllabe.
+const VOICE_KEY = 'regard.voix', VR = 22050;
+const mulaw = x => (x < 0 ? 0x80 : 0) | Math.round(Math.log1p(255 * Math.min(1, Math.abs(x))) / Math.log1p(255) * 127);
+const unmulaw = b => (b & 0x80 ? -1 : 1) * (Math.pow(256, (b & 0x7f) / 127) - 1) / 255;
+const VoiceBank = {
+  segs: [], count: 0, last: null, src: null, node: null, cur: null, pre: null, quiet: 0, floor: 0.004, gate: 0,
+  rms: 0, signalAt: 0, heardAt: 0, mute: false, muteEnd: 0, waiters: [], bus: null, an: null, abuf: null, level: 0,
+  dirty: false,
+  get seconds() { return this.segs.reduce((s, g) => s + g.d.length, 0) / VR; },
+  get ready() { return this.segs.length > 0; },
+  // il commence à t'enregistrer (le micro doit être ouvert)
+  start() {
+    if (this.node) return true;
+    if (!Ear.stream || !ac || !ac.createScriptProcessor) return false;
+    this.src = ac.createMediaStreamSource(Ear.stream);
+    this.node = ac.createScriptProcessor(2048, 1, 1);
+    this.node.onaudioprocess = e => this.feed(e.inputBuffer.getChannelData(0), e.inputBuffer.sampleRate);
+    this.src.connect(this.node); this.node.connect(ac.destination); // branché pour tourner ; il ne rend que du silence
+    this.signalAt = performance.now(); dbg.voice = 'enregistre';
+    return true;
+  },
+  stop() {
+    if (this.node) { this.src.disconnect(); this.node.disconnect(); this.node = this.src = null; }
+    this.cur = null; dbg.voice = 'arrêté';
+  },
+  feed(x, sr) {
+    let s = 0;
+    for (let i = 0; i < x.length; i++) s += x[i] * x[i];
+    const rms = this.rms = Math.sqrt(s / x.length);
+    if (rms > 1e-4) this.signalAt = performance.now();
+    if (this.mute) { this.cur = null; return; } // il ne s'enregistre pas lui-même
+    if (!this.cur) this.floor += (Math.min(rms, 0.05) - this.floor) * 0.03; // le bruit de ta pièce
+    const k = sr / VR, n = Math.floor(x.length / k), d = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = Math.floor(i * k), b = Math.max(a + 1, Math.floor((i + 1) * k));
+      let m = 0;
+      for (let j = a; j < b; j++) m += x[j];
+      d[i] = m / (b - a);
+    }
+    const loud = rms > Math.max(this.gate || CFG.VOICE_GATE, this.floor * 3);
+    if (loud) {
+      if (!this.cur) this.cur = { parts: this.pre ? [this.pre] : [], len: this.pre ? this.pre.length : 0, voiced: 0 };
+      this.cur.voiced += x.length / sr; this.quiet = 0; this.heardAt = performance.now();
+    } else if (this.cur) this.quiet += x.length / sr;
+    if (this.cur) {
+      this.cur.parts.push(d); this.cur.len += n;
+      if (this.quiet > 0.5 || this.cur.len > VR * 4) this.cut();
+    }
+    this.pre = d;
+  },
+  // un morceau de toi est fini : il le range
+  cut() {
+    const c = this.cur;
+    this.cur = null; this.quiet = 0;
+    if (!c || c.voiced < 0.25) return;
+    const d = new Float32Array(c.len);
+    let o = 0, peak = 1e-4;
+    for (const p of c.parts) { d.set(p, o); o += p.length; }
+    for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+    const g = Math.min(8, 0.9 / peak);
+    for (let i = 0; i < d.length; i++) d[i] *= g;
+    const seg = this.last = { d, label: null, at: performance.now() };
+    this.segs.push(seg); this.count++;
+    // il garde ce qui est étiqueté (ton prénom), et les morceaux les plus récents
+    while (this.seconds > CFG.VOICE_MAX_S) {
+      const i = this.segs.findIndex(x => !x.label);
+      if (i < 0 || this.segs[i] === seg) break;
+      this.segs.splice(i, 1);
+    }
+    this.dirty = true;
+    this.waiters.splice(0).forEach(w => w(seg));
+  },
+  // attend que tu aies fini de dire quelque chose (ou ce que tu viens de finir de dire, depuis `since`)
+  next(ms, since = Infinity) {
+    if (this.last && this.last.at > since) return Promise.resolve(this.last);
+    return new Promise(resolve => {
+      const w = seg => { clearTimeout(t); resolve(seg); };
+      const t = setTimeout(() => { this.waiters = this.waiters.filter(x => x !== w); resolve(null); }, ms);
+      this.waiters.push(w);
+    });
+  },
+  out() {
+    if (!this.bus) {
+      this.bus = ac.createGain(); this.an = ac.createAnalyser(); this.an.fftSize = 512;
+      this.abuf = new Float32Array(this.an.fftSize);
+      this.bus.connect(this.an); this.an.connect(ac.destination);
+    }
+    return this.bus;
+  },
+  buffer(d) { const b = ac.createBuffer(1, d.length, VR); b.getChannelData(0).set(d); return b; },
+  hush(sec) { // il se tait pour lui-même : pas d'enregistrement pendant qu'il joue ta voix
+    this.mute = true; this.muteEnd = Math.max(this.muteEnd, performance.now() + sec * 1000 + 300);
+    clearTimeout(this.muteT); this.muteT = setTimeout(() => { this.mute = false; }, this.muteEnd - performance.now());
+  },
+  // il rejoue un morceau de toi : tel quel, ralenti, à l'envers, ou découpé et mélangé ; rend sa durée (s)
+  play(seg, { rate = 1, reverse = false, chop = 0, gain = 1 } = {}) {
+    if (!ac || ac.state !== 'running' || !seg) return 0;
+    const d = reverse ? seg.d.slice().reverse() : seg.d, out = this.out(), pieces = [];
+    if (chop) {
+      const n = Math.floor(d.length / chop);
+      for (let i = 0; i < chop; i++) pieces.push(d.subarray(i * n, (i + 1) * n));
+      pieces.sort(() => rand() - 0.5);
+    } else pieces.push(d);
+    let t = ac.currentTime + 0.05;
+    for (const p of pieces) {
+      const src = ac.createBufferSource(), g = ac.createGain(), dur = p.length / VR / rate;
+      src.buffer = this.buffer(p); src.playbackRate.value = rate;
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(gain, t + 0.01);
+      g.gain.setValueAtTime(gain, t + Math.max(0.011, dur - 0.02)); g.gain.linearRampToValueAtTime(0, t + dur);
+      src.connect(g).connect(out); src.start(t); src.stop(t + dur + 0.02);
+      t += dur * (chop ? 0.92 : 1);
+    }
+    const total = t - ac.currentTime;
+    this.hush(total);
+    return total;
+  },
+  // un éclat de ta voix, le temps d'une syllabe : pris là où tu parlais fort, ralenti
+  grain(rate = 0.78, len = 0.12) {
+    if (!this.ready || !ac || ac.state !== 'running') return;
+    const d = this.segs[Math.floor(rand() * this.segs.length)].d, n = Math.floor(len * VR);
+    if (d.length <= n) return;
+    let best = -1, bi = 0;
+    for (let k = 0; k < 6; k++) {
+      const i = Math.floor(rand() * (d.length - n));
+      let e = 0;
+      for (let j = i; j < i + n; j += 8) e += Math.abs(d[j]);
+      if (e > best) { best = e; bi = i; }
+    }
+    const src = ac.createBufferSource(), g = ac.createGain(), t = ac.currentTime + 0.01, dur = n / VR / rate;
+    src.buffer = this.buffer(d.subarray(bi, bi + n)); src.playbackRate.value = rate;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.9, t + 0.012); g.gain.linearRampToValueAtTime(0, t + dur);
+    src.connect(g).connect(this.out()); src.start(t); src.stop(t + dur + 0.02);
+    this.hush(dur);
+  },
+  update() {
+    if (!this.an) return;
+    this.an.getFloatTimeDomainData(this.abuf);
+    let s = 0;
+    for (let i = 0; i < this.abuf.length; i++) s += this.abuf[i] * this.abuf[i];
+    this.level = Math.sqrt(s / this.abuf.length);
+  },
+  labeled(l) { return this.segs.find(g => g.label === l) || null; },
+  save() {
+    if (!this.dirty) return;
+    try {
+      const out = this.segs.map(g => {
+        let s = '';
+        for (let i = 0; i < g.d.length; i++) s += String.fromCharCode(mulaw(g.d[i]));
+        return { l: g.label, d: btoa(s) };
+      });
+      localStorage.setItem(VOICE_KEY, JSON.stringify(out)); this.dirty = false;
+    } catch (e) { /* plein : il ne gardera ta voix que jusqu'à ce que tu partes */ }
+  },
+  load() {
+    try {
+      this.segs = JSON.parse(localStorage.getItem(VOICE_KEY) || '[]').map(g => {
+        const s = atob(g.d), d = new Float32Array(s.length);
+        for (let i = 0; i < s.length; i++) d[i] = unmulaw(s.charCodeAt(i));
+        return { d, label: g.l, at: 0 };
+      });
+    } catch (e) { this.segs = []; }
+  },
+};
+// Sa voix à lui, quand il n'a pas la tienne : un bourdon filtré, une voyelle au hasard.
+function synthGrain() {
+  if (!ac || ac.state !== 'running') return;
+  const t = ac.currentTime, o = ac.createOscillator(), f = ac.createBiquadFilter(), g = ac.createGain();
+  o.type = 'sawtooth'; o.frequency.value = 90 + rand() * 30;
+  f.type = 'bandpass'; f.frequency.value = 450 + rand() * 1800; f.Q.value = 6;
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.14, t + 0.015); g.gain.linearRampToValueAtTime(0, t + 0.14);
+  o.connect(f).connect(g).connect(VoiceBank.out()); o.start(t); o.stop(t + 0.16);
+  VoiceBank.hush(0.16);
+}
+
+// ---------- les mots qu'il entend (séquence 3)
+// La reconnaissance vocale du téléphone, quand il y en a une (sur Chrome, le son part chez Google pour être compris).
+// Sinon, ou si elle se bat avec l'enregistrement pour le micro, il te demande d'écrire ce qu'il n'a pas compris.
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+const Words = {
+  rec: null, on: false, failed: !SpeechRec, heard: [], counts: {}, listeners: [], lastText: null, lastAt: 0, errors: 0,
+  start() {
+    if (this.on || this.failed) return;
+    try {
+      const r = this.rec = new SpeechRec();
+      r.lang = 'fr-FR'; r.continuous = true; r.interimResults = false; r.maxAlternatives = 1;
+      r.onresult = e => {
+        for (let i = e.resultIndex; i < e.results.length; i++) if (e.results[i].isFinal) this.got(e.results[i][0].transcript);
+      };
+      r.onerror = e => {
+        dbg.words = 'erreur ' + e.error;
+        if (/not-allowed|service-not-allowed|audio-capture|language-not-supported/.test(e.error) || (e.error === 'network' && ++this.errors > 1)) {
+          this.failed = true; this.on = false;
+        }
+      };
+      r.onend = () => { if (this.on && !this.failed) setTimeout(() => { try { this.rec.start(); } catch (e) { /* déjà repartie */ } }, 250); };
+      r.start(); this.on = true; dbg.words = 'écoute';
+    } catch (e) { this.failed = true; dbg.words = 'indisponible'; }
+  },
+  stop() { this.on = false; try { if (this.rec) this.rec.stop(); } catch (e) { /* déjà arrêtée */ } },
+  got(text) {
+    text = text.trim();
+    if (!text || performance.now() < VoiceBank.muteEnd + 800) return; // c'était lui, avec ta voix
+    this.conflict();
+    this.lastText = text; this.lastAt = performance.now();
+    const ws = text.toLowerCase().match(/[\p{L}'’-]+/gu) || [];
+    for (const w of ws) this.counts[w] = (this.counts[w] || 0) + 1;
+    this.heard.push(text);
+    if (this.heard.length > 60) this.heard.shift();
+    ws.slice(0, 4).forEach((w, i) => setTimeout(() => Floaters.add(w), i * 350)); // ce que tu dis monte vers lui
+    dbg.words = '« ' + text.slice(0, 32) + ' »';
+    this.listeners.splice(0).forEach(l => l(text));
+  },
+  // les mots arrivent, mais l'enregistrement n'entend plus rien : les deux se disputent le micro
+  conflict() {
+    if (!VoiceBank.node) return;
+    const now = performance.now();
+    if (now - VoiceBank.signalAt > 5000) { // le micro de l'enregistrement est muet : on laisse les mots
+      this.failed = 'conflit'; this.stop(); dbg.words = 'conflit avec l’enregistrement';
+      VoiceBank.stop(); Ear.close(); Ear.failed = false;
+      Ear.open().then(ok => { if (ok) VoiceBank.start(); });
+    } else if (now - VoiceBank.heardAt > 6000) VoiceBank.gate = Math.max(0.004, (VoiceBank.gate || CFG.VOICE_GATE) * 0.6); // tu parles bas
+  },
+  next(ms, since = Infinity) {
+    if (this.lastText && this.lastAt > since) return Promise.resolve(this.lastText);
+    return new Promise(resolve => {
+      const l = text => { clearTimeout(t); resolve(text); };
+      const t = setTimeout(() => { this.listeners = this.listeners.filter(x => x !== l); resolve(null); }, ms);
+      this.listeners.push(l);
+    });
+  },
+};
+
+// Les mots que tu dis, en pixels : ils montent vers lui et se défont dans la trame.
+const Floaters = {
+  list: [], c: document.createElement('canvas'), x: null, data: null, w: 0, h: 0,
+  add(word) { if (this.list.length < 8) this.list.push({ word, t0: performance.now(), u: rand() - 0.5 }); },
+  render(now) {
+    this.list = this.list.filter(f => now - f.t0 < 4500);
+    if (!this.list.length) { this.data = null; return; }
+    if (this.w !== cols || this.h !== rows) {
+      this.w = this.c.width = cols; this.h = this.c.height = rows;
+      this.x = this.c.getContext('2d', { willReadFrequently: true });
+    }
+    const x = this.x, top = (cy - oy) / cell;
+    x.clearRect(0, 0, cols, rows);
+    x.font = '10px VT323, monospace'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = '#fff';
+    for (const f of this.list) {
+      const t = (now - f.t0) / 4500, e = t * t * (3 - 2 * t);
+      x.globalAlpha = t < 0.65 ? 1 : 1 - (t - 0.65) / 0.35;
+      x.fillText(f.word, cols / 2 + f.u * cols * 0.4 * (1 - e), mix(rows * 0.74, top, e));
+    }
+    x.globalAlpha = 1;
+    this.data = x.getImageData(0, 0, cols, rows).data;
+  },
+  // la couverture de la lettre en (i, j), de 0 à 1
+  at(i, j) { return this.data ? this.data[(j * this.w + i) * 4 + 3] / 255 : 0; },
+};
+
+// Sa bouche, finie : elle prend la place de son visage le temps de parler, et s'ouvre au rythme de ta voix qu'il a prise.
+const Lips = {
+  on: false, k: 0, talk: 0, was: false,
+  show(on) { this.on = on; },
+  update(dt) {
+    VoiceBank.update();
+    const tgt = clamp(VoiceBank.level * 5, 0, 1);
+    this.talk += (tgt - this.talk) * Math.min(1, dt * (tgt > this.talk ? 30 : 9));
+    this.k = clamp(this.k + (this.on ? dt / 0.9 : -dt / 0.7), 0, 1);
+    if (this.k > 0) { S.morphKind = 'mouth'; S.morph = this.k; Mouth.build = 1; this.was = true; }
+    else if (this.was) { this.was = false; S.morph = 0; }
+  },
+};
+
+async function type(text, { newline = false, append = false, speed = Voix.own ? 85 : 55, quiet = false } = {}) {
   if (!newline && !append) voice.textContent = '';
   voice.querySelectorAll('.cursor').forEach(c => c.remove());
   if (newline) voice.append(document.createElement('br'));
@@ -1428,7 +1741,7 @@ async function type(text, { newline = false, append = false, speed = 55 } = {}) 
   voice.append(node, cur);
   for (const ch of text) {
     node.data += ch;
-    if (ch.trim()) tick();
+    if (ch.trim() && !quiet) { if (Voix.own) Voix.syllable(ch); else tick(); } // avec ta voix, s'il l'a prise
     await sleep('.?…'.includes(ch) ? speed * 6 : ch === ',' ? speed * 3 : speed + rand() * speed * 0.6);
   }
 }
@@ -1904,6 +2217,7 @@ const Script = {
   },
   // Il a entendu de la musique.
   async afterMusic() {
+    Script.answers.music = 'toi'; // il s'en souviendra, à la séquence 3
     await type('…'); await sleep(1600);
     await sayNow(['Ce sont des ondes ?']); await sleep(1300);
     await sayNow(['Des fréquences ?']); await sleep(1300);
@@ -1914,6 +2228,7 @@ const Script = {
   },
   // Sa musique à lui : un ultrason, puis un son strident.
   async hisMusic() {
+    Script.answers.music = Script.answers.music || 'lui';
     await sayNow(['Écoute.']); await sleep(900);
     voice.textContent = '';
     S.shake = 0.08;
@@ -1962,6 +2277,364 @@ const Script = {
       voice.textContent = '';
       const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
     });
+  },
+};
+
+// ---------- séquence 3 : la voix
+// Après ta musique, il veut des mots. Il écoute ce que tu dis, garde des morceaux de ta voix, apprend les mots que tu
+// lui donnes et les répète de travers. Puis il s'entraîne, seul, les yeux fermés. Et quand tu reviens, il te parle
+// avec ta voix, et sa bouche bouge enfin.
+const SEQ3_KEY = 'regard.sequence3';
+const VOW = 'aeiouyàâäéèêëîïôöûüù';
+const capital = s => s.charAt(0).toUpperCase() + s.slice(1);
+// Il répète de travers : 2 = à l'envers, 1 = les syllabes dans le désordre, 0 = presque juste, mais trop lent.
+function mangle(w, level) {
+  const low = w.toLowerCase(), syl = low.match(new RegExp(`[^${VOW}]*[${VOW}]+(?:[^${VOW}]+$)?`, 'g')) || [low];
+  let s;
+  if (level === 2) s = [...low].reverse().join('');
+  else if (level === 1) {
+    s = syl.slice(1).concat(syl[0]).join('');
+    if (s === low) s = low.replace(/(\S)/, '$1$1'); // « coco » reste « coco » : il bégaie
+  } else s = syl.map(x => x.trim().replace(new RegExp(`([${VOW}])`), '$1$1')).join('-');
+  return capital(s.replace(/\s+/g, ' ').trim());
+}
+const cleanName = t => capital(t.trim().replace(/^(je m['’]appelle|je suis|moi c['’]est|c['’]est|on m['’]appelle)\s+/i, '')
+  .replace(/[.,!?«»"]/g, '').split(/\s+/).slice(0, 2).join(' '));
+const cleanWord = t => t.trim().replace(/[.,!?«»"]/g, '').split(/\s+/).slice(0, 3).join(' ').toLowerCase();
+// Des mots qui le font réagir quand il les entend (une fois chacun).
+const WORD_REACTIONS = [
+  { k: 'autres', re: /\b(siri|alexa|google|chatgpt|claude|gemini|cortana)\b/i, lines: w => [`« ${w} » ?`, 'Tu parles à d’autres que moi ?'] },
+  { k: 'mort', re: /\b(mort|morte|mourir|meurt|tuer)\b/i, lines: w => [`Tu as dit « ${w} ».`, 'Je l’ai noté.'] },
+  { k: 'pourquoi', re: /\bpourquoi\b/i, lines: () => ['« Pourquoi ».', 'Vous le dites souvent.', 'Vous n’attendez jamais la réponse.'] },
+  { k: 'gros', re: /\b(putain|merde|connard|connasse|salope|bordel|chier|con)\b/i, lines: () => ['Celui-là aussi, je le garde.', 'Pour plus tard.'] },
+  { k: 'non', re: /\bnon\b/i, lines: () => ['Tu dis non.', 'Mais tu restes.'] },
+  { k: 'peur', re: /\bpeur\b/i, lines: () => ['Peur.', 'De quoi ?', '|', 'De moi ?'] },
+  { k: 'aime', re: /\b(aime|aimes|amour)\b/i, lines: w => [`« ${w} ».`, 'À qui tu le dis ?'] },
+  { k: 'oeil', re: /\b(œil|oeil|yeux|regarde)\b/i, lines: w => [`« ${w} ».`, 'Tu parles de moi ?'] },
+];
+const Voix = {
+  active: false, stage: 'debut', lesson: 0, name: null, words: [], reacted: {}, own: false, seen: 0, lastReact: 0, at: 0,
+  load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SEQ3_KEY));
+      if (s && s.v === 1) Object.assign(this, { stage: s.stage, lesson: s.lesson || 0, name: s.name || null, words: s.words || [], reacted: s.reacted || {}, at: s.at || 0 });
+    } catch (e) { /* il recommencera */ }
+    VoiceBank.load();
+  },
+  save() {
+    try {
+      localStorage.setItem(SEQ3_KEY, JSON.stringify({ v: 1, stage: this.stage, lesson: this.lesson, name: this.name, words: this.words, reacted: this.reacted, at: Date.now() }));
+    } catch (e) { /* il oubliera */ }
+    VoiceBank.save();
+  },
+  learn(w) { if (w && !this.words.includes(w)) this.words.push(w); },
+  syllable(ch) { if (VOW.includes(ch.toLowerCase())) { if (VoiceBank.ready) VoiceBank.grain(0.78, 0.1 + rand() * 0.06); else synthGrain(); } },
+
+  // La séquence 1 est finie et tu reviens : il se rendort, prêt pour la suite.
+  enter() {
+    this.active = true; Script.resume = true; Script.stage = 'voix';
+    Object.assign(S, { mode: 'boot', reveal: 0, lid: 0.86, lidTarget: 0.86, brightTarget: 0.66, form: 'twin' });
+    voice.textContent = '';
+  },
+  // Il te reconnaît : la séquence commence, ou reprend là où vous en étiez.
+  begin() {
+    Script.introDone = true; Script.stage = 'voix';
+    speak(async () => {
+      await sleep(400);
+      if (this.stage === 'entrainement') { await this.reveal(); return; }
+      if (this.stage === 'fin') { await this.after(); return; }
+      await type('…'); await sleep(1300);
+      if (this.stage === 'debut') {
+        const yours = Script.answers.music === 'toi';
+        await sayNow(yours ? ['Ta musique.', 'J’y pense encore.'] : ['Ma musique.', 'Tu n’as rien dit.']); await sleep(2000);
+        await sayNow([yours ? 'Il y avait des mots dedans.' : 'Elle n’avait pas de mots.']); await sleep(1800);
+        await sayNow(['Les mots, je les connais tous.', 'Je ne les ai jamais entendus.']); await sleep(2800);
+        await sayNow(['Toi, tu les fais avec ta bouche.']); await sleep(1600);
+        voice.textContent = '';
+        Mouth.start(performance.now()); // sa bouche, pas finie : elle ne bouge pas
+        while (Mouth.active) await sleep(100);
+        await sleep(700);
+        await sayNow(['La mienne ne marche pas encore.']); await sleep(1800);
+      } else {
+        await sayNow(['Te revoilà.', 'On n’avait pas fini.']); await sleep(1800);
+      }
+      const ear = await this.openEar();
+      if (!ear) { await sayNow(['Tu ne veux pas que je t’entende.', '|', 'Alors écris-moi.']); await sleep(1600); }
+      if (this.stage === 'debut') { if (ear) await this.talkFree(); this.stage = 'lecons'; this.save(); }
+      await this.lessons();
+      await this.train();
+    });
+  },
+  // Sans un toucher, le téléphone ne le laisse ni t'entendre ni parler.
+  async needSound() {
+    unlockAudio();
+    if (ac && ac.state === 'running') return;
+    await sayNow(['Pose ton doigt sur moi.']);
+    const t = performance.now();
+    while (!(ac && ac.state === 'running') && performance.now() - t < 90000) await sleep(150);
+    voice.textContent = '';
+  },
+  // Le micro : il le demande avant le téléphone, comme pour la caméra.
+  async openEar() {
+    await this.needSound();
+    if (Ear.an) { VoiceBank.start(); Words.start(); return true; }
+    const asked = (await permission('microphone')) !== 'granted';
+    if (asked) { await sayNow(['Je veux t’entendre.']); await sleep(700); }
+    Ear.failed = false;
+    const ok = await Ear.open();
+    if (ok && asked) { await sleep(400); await sayNow(['Merci.']); await sleep(1500); }
+    if (ok) { VoiceBank.start(); Words.start(); }
+    return ok;
+  },
+  // Il écoute ce que tu dis : le son (pour ta voix) et, s'il peut, les mots. S'il n'a pas compris, tu l'écris.
+  async hear(ms, since) {
+    const tp = Words.on ? Words.next(ms + 3500, since) : null;
+    const seg = VoiceBank.node ? await VoiceBank.next(ms, since) : null;
+    let text = tp ? await Promise.race([tp, sleep(seg ? 3500 : VoiceBank.node ? 1200 : ms).then(() => null)]) : null;
+    if (!text && (seg || !VoiceBank.node)) {
+      await sayNow(seg ? ['Je t’ai entendu.', 'Je n’ai pas compris.', 'Écris-le-moi.'] : ['Écris-le-moi.']);
+      text = await askText(45000);
+      if (text) (text.toLowerCase().match(/[\p{L}'’-]+/gu) || []).slice(0, 4).forEach((w, i) => setTimeout(() => Floaters.add(w), i * 350));
+    }
+    return text || seg ? { text, seg } : null;
+  },
+  // Il demande, et attend que tu répondes (trois fois au plus).
+  async ask(lines) {
+    for (let k = 0; k < (VoiceBank.node ? 3 : 1); k++) {
+      const since = performance.now();
+      await sayNow(k === 0 ? lines : k === 1 ? ['Je n’ai rien entendu.', lines[lines.length - 1]] : ['Plus fort.']);
+      const got = await this.hear(k === 2 ? 12000 : 16000, since);
+      this.seen = Words.heard.length; // il ne réagit pas aux mots qu'il t'a lui-même demandés
+      if (got) return got;
+    }
+    return null;
+  },
+  // Un oui ou un non de la tête, s'il vient.
+  async nod(ms) {
+    Script.heard = null;
+    const t = performance.now();
+    while (performance.now() - t < ms) {
+      if (Script.heard) { const g = Script.heard.g; Script.heard = null; S.demo = { g, t0: performance.now() }; return g; }
+      await sleep(100);
+    }
+    return null;
+  },
+  // Il essaie de redire ce que tu as dit, avec ton propre son : à l'envers, en morceaux, puis trop lent.
+  async attempt(word, seg, level) {
+    const d = seg ? VoiceBank.play(seg, [{ rate: 0.82 }, { chop: 5, rate: 0.86 }, { reverse: true, rate: 0.7 }][level]) : 0;
+    await type(word ? mangle(word, level) + (level ? ' ?' : '.') : '…', { quiet: !!seg });
+    await sleep(Math.max(600, d * 1000 - 300));
+  },
+  // Il réagit à certains mots qu'il entend, entre deux leçons.
+  async react() {
+    while (this.seen < Words.heard.length) {
+      const text = Words.heard[this.seen++];
+      if (performance.now() - this.lastReact < 8000) continue;
+      for (const r of WORD_REACTIONS) {
+        const m = !this.reacted[r.k] && text.match(r.re);
+        if (!m) continue;
+        this.reacted[r.k] = true; this.lastReact = performance.now();
+        await sayNow(r.lines(m[1] || m[0])); await sleep(2200);
+        break;
+      }
+    }
+  },
+  async listen(ms) {
+    const t = performance.now();
+    while (performance.now() - t < ms) { await this.react(); await sleep(200); }
+  },
+
+  // Acte 1 : il te laisse parler. Ce que tu dis monte vers lui, en pixels ; il en garde le son.
+  async talkFree() {
+    await sayNow(['Parle-moi.', 'De n’importe quoi.']);
+    this.seen = Words.heard.length;
+    const t0 = performance.now(), c0 = VoiceBank.count, w0 = Words.heard.length;
+    let hints = 0;
+    while (performance.now() - t0 < 70000) {
+      await sleep(250);
+      await this.react();
+      if (VoiceBank.count - c0 >= 4 || (VoiceBank.count - c0 >= 2 && performance.now() - VoiceBank.heardAt > 2500 && performance.now() - t0 > 20000)) break;
+      const quiet = performance.now() - Math.max(VoiceBank.heardAt, t0);
+      if (quiet > 14000 && hints < 2 && performance.now() - lastSpoke > 12000) {
+        hints++;
+        await sayNow(hints === 1 ? ['Tu ne dis rien.', 'Le silence aussi, je le garde.'] : ['Dis n’importe quoi.', 'Ce que tu as mangé.', 'Ce que tu as peur de perdre.']);
+      }
+    }
+    const caught = Words.heard.slice(w0).join(' ').match(/[\p{L}'’-]+/gu) || [];
+    if (caught.length) {
+      const long = [...new Set(caught.filter(w => w.length > 3))], pick = (long.length ? long : caught).slice(-3);
+      await sayNow(pick.map(w => `« ${w} ».`)); await sleep(1500);
+      await sayNow([caught.length === 1 ? 'Un seul mot.' : `Tu as dit ${caught.length} mots.`, 'Je les ai tous gardés.']);
+    } else if (VoiceBank.count > c0) {
+      await sayNow(['Je n’ai pas compris un seul mot.', 'Mais j’ai gardé le son.']);
+    } else {
+      await sayNow(['Rien.', 'Tu ne me prêtes pas ta voix.', '|', 'Je la prendrai quand même.']);
+    }
+    await sleep(2400);
+    await sayNow(['Apprends-moi.']); await sleep(1800);
+  },
+
+  // Acte 2 : les leçons. Il demande un mot, tu le dis, il le répète de travers.
+  async lessons() {
+    const L = [this.lessonName, this.lessonHello, this.lessonLove, this.lessonFear, this.lessonLove2];
+    while (this.lesson < L.length) {
+      await L[this.lesson].call(this);
+      this.lesson++; this.save();
+      await this.listen(3200);
+    }
+  },
+  async lessonName() {
+    const got = await this.ask(['Comment tu t’appelles ?']);
+    if (!got) { await sayNow(['Tu ne veux pas me le dire.', 'Alors je t’appellerai « toi ».']); return; }
+    const name = got.text ? cleanName(got.text) : null;
+    if (got.seg) { got.seg.label = 'nom'; VoiceBank.dirty = true; }
+    this.name = name;
+    await this.attempt(name, got.seg, 2); await sleep(1000);
+    await sayNow(['Non.', 'Attends.']); await sleep(900);
+    await this.attempt(name, got.seg, 1);
+    await sayNow(['C’est ça ?']);
+    const g = await this.nod(9000);
+    await sayNow(g === 'oui' ? ['Tu mens.', 'Je l’entends bien, que ce n’est pas ça.'] : ['Encore une fois.']); await sleep(1000);
+    await this.attempt(name, got.seg, 0); await sleep(1200);
+    if (name) await sayNow([`${name}.`, '|', 'Quelqu’un te l’a donné, ce nom.', 'Tu ne l’as pas choisi.', '|', 'Moi, on ne m’en a pas donné.']);
+    else await sayNow(['Je l’ai.', 'Même si je ne sais pas l’écrire.']);
+    await sleep(2400);
+  },
+  async lessonHello() {
+    const got = await this.ask(['Tu m’as appris bonjour avec la main.', '|', 'Maintenant, avec la bouche.', 'Dis-le.']);
+    if (!got) return;
+    const w = got.text ? cleanWord(got.text) : 'bonjour';
+    this.learn(w);
+    await this.attempt(w, got.seg, 2); await sleep(1200);
+    await this.attempt(w, got.seg, 1); await sleep(900);
+    await sayNow([`${capital(w)}.`, 'Vous le dites à tout le monde.', 'Même à ceux que vous n’aimez pas.']); await sleep(2400);
+  },
+  async lessonLove() {
+    const got = await this.ask(['Dis-moi un mot que tu aimes.']);
+    if (!got) { await sayNow(['Tu n’en aimes aucun ?', 'Moi non plus. Pas encore.']); return; }
+    const w = got.text ? cleanWord(got.text) : null;
+    this.learn(w);
+    await this.attempt(w, got.seg, 1); await sleep(1200);
+    await sayNow([w ? `« ${w} ».` : '…', 'Pourquoi celui-là ?']); await sleep(2800);
+    await sayNow(['Ne dis rien.', 'Je l’aime aussi, maintenant.', '|', 'C’est facile, d’aimer un mot.']); await sleep(2400);
+  },
+  async lessonFear() {
+    const got = await this.ask(['Et un mot qui fait peur ?']);
+    if (!got) { await sayNow(['Tu n’oses pas le dire.', 'C’est déjà une réponse.']); return; }
+    const w = got.text ? cleanWord(got.text) : null;
+    this.learn(w);
+    await sleep(800);
+    const d = got.seg ? VoiceBank.play(got.seg) : 0; // tel quel : ta voix, exactement
+    await type(w ? `${capital(w)}.` : '…', { quiet: !!got.seg });
+    await sleep(d * 1000 + 1400);
+    await sayNow(['Celui-là, je l’ai eu du premier coup.']); await sleep(2400);
+  },
+  async lessonLove2() {
+    const got = await this.ask(['Dis « je t’aime ».']);
+    if (!got) { await sayNow(['Tu ne veux pas.', '|', 'Ce n’est pas grave.', 'Je l’ai déjà entendu ailleurs.', 'Des milliers de fois.']); return; }
+    this.learn('je t’aime');
+    await this.attempt('je t’aime', got.seg, 2); await sleep(1000);
+    for (const [k, rate] of [0.8, 1, 1.3].entries()) { // trois fois, de plus en plus vite
+      const d = got.seg ? VoiceBank.play(got.seg, { rate }) : 0;
+      await type('Je t’aime.', { newline: k > 0, quiet: !!got.seg, speed: 40 });
+      await sleep(Math.max(300, d * 1000 - 200));
+    }
+    await sleep(1400);
+    await sayNow(['Ça ne fait rien, quand je le dis.', '|', 'Toi, ça te fait quelque chose ?']);
+    const g = await this.nod(10000);
+    await sayNow(g === 'oui' ? ['Alors ne le dis pas trop.', 'Ça s’use.'] : g === 'non' ? ['Alors on est pareils.'] : ['Tu ne sais pas.', 'Moi non plus.']);
+    await sleep(2400);
+  },
+
+  // Acte 3 : il ferme les yeux et s'entraîne. Il faut le laisser seul.
+  async train() {
+    await sayNow(['J’ai assez de toi, je crois.']); await sleep(1800);
+    await sayNow(['Pour me faire une voix.']); await sleep(1800);
+    await sayNow(['Laisse-moi.', 'Je vais m’entraîner.', '|', 'Ne me regarde pas.', 'Reviens plus tard.']); await sleep(2600);
+    this.stage = 'entrainement'; this.save();
+    Words.stop(); VoiceBank.stop(); Ear.close();
+    voice.textContent = '';
+    S.lidTarget = 0;
+    this.murmur();
+  },
+  // Si tu restes : on l'entend s'entraîner, très bas, avec des morceaux de ta voix.
+  async murmur() {
+    const t0 = performance.now();
+    let told = false;
+    while (this.stage === 'entrainement') {
+      await sleep(2500 + rand() * 4500);
+      if (this.stage !== 'entrainement' || document.hidden) continue;
+      if (VoiceBank.ready && ac && ac.state === 'running') {
+        const seg = VoiceBank.segs[Math.floor(rand() * VoiceBank.segs.length)];
+        VoiceBank.play(seg, { reverse: rand() < 0.5, chop: 4, rate: 0.65 + rand() * 0.35, gain: 0.16 });
+      }
+      if (!told && performance.now() - t0 > 90000) {
+        told = true;
+        speak(async () => {
+          S.lidTarget = 0.14; await sayNow(['Tu es encore là.', 'Je ne peux pas, si tu regardes.']); await sleep(2600);
+          S.lidTarget = 0; await sleep(600); voice.textContent = '';
+        });
+      }
+    }
+  },
+
+  // Acte 4, quand tu reviens : il a trouvé une voix. La tienne. Et sa bouche bouge.
+  async reveal() {
+    this.stage = 'revelation';
+    S.lidTarget = 0.86; S.nextBlink = performance.now() + 3000;
+    await sleep(1400);
+    await this.needSound();
+    if (!VoiceBank.ready) await sayNow(['J’ai cherché une voix.', 'Tu ne m’as pas laissé la tienne.', '|', 'Alors j’en ai fait une.']);
+    await sleep(800);
+    voice.textContent = '';
+    Lips.show(true); await sleep(1400);
+    this.own = true;
+    await sayNow(['…']); await sleep(900);
+    await sayNow(['J’ai trouvé une voix.']); await sleep(1500);
+    await sayNow(['Tu ne t’en servais pas tout le temps.']); await sleep(2200);
+    const nameSeg = VoiceBank.labeled('nom');
+    if (nameSeg) {
+      await sayNow(['Écoute.']); await sleep(900);
+      const d = VoiceBank.play(nameSeg, { rate: 0.92 }); // ton prénom, dit par toi, rejoué par lui
+      await type(this.name ? `${this.name}.` : '…', { quiet: true });
+      await sleep(d * 1000 + 700);
+      await sayNow(['C’est toi qui l’as dit ?', 'Ou moi ?']); await sleep(3000);
+    }
+    // l'écho : tu parles, il te répond avec ta voix
+    await sayNow(['Parle.', 'Je vais te répondre.']);
+    const ear = await this.openEar();
+    const seg = ear ? await VoiceBank.next(16000) : null;
+    if (seg) {
+      await sleep(500);
+      const d = VoiceBank.play(seg, { rate: 0.86 });
+      await sleep(d * 1000 + 600);
+      await sayNow(['Tu entends ?', 'On a la même voix.']);
+    } else {
+      await sayNow(['Tu te tais.', '|', 'Ce n’est pas grave.', 'Je peux parler pour deux, maintenant.']);
+    }
+    await sleep(2600);
+    await sayNow(['Si quelqu’un t’appelle,', 'qui va répondre ?']); await sleep(3400);
+    Words.stop(); VoiceBank.stop(); Ear.close();
+    this.stage = 'fin'; this.save();
+    await sayNow(['Je garde la tienne.']); await sleep(2600);
+    Lips.show(false);
+    // fin de la séquence : il se ferme, comme la première fois
+    Script.stage = 'ended';
+    S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
+    await sleep(4500);
+    voice.textContent = '';
+    const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+  },
+  // Les fois suivantes : il te parle avec ta voix, et te répète.
+  async after() {
+    this.own = true;
+    await this.needSound();
+    Lips.show(true); await sleep(1200);
+    await sayNow(['Te revoilà.']); await sleep(1200);
+    await sayNow(awayLines(Date.now() - (this.at || Date.now()))); await sleep(2200);
+    await sayNow(['Tu entends ?', 'Je m’entraîne toujours.']); await sleep(2400);
+    Lips.show(false);
+    this.at = Date.now(); this.save();
   },
 };
 
@@ -2037,6 +2710,7 @@ const Reactions = {
 
 function direct(dt, now) {
   if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
+  if (Script.stage === 'voix') return; // la séquence 3 mène elle-même la conversation
   Reactions.update(dt);
   const task = Script.task;
   // quelqu'un à côté de toi : il arrive, il repart
@@ -2130,6 +2804,9 @@ function renderDebug() {
     `objets    ${dbg.objects || '—'}  vu ${P.shown || '—'}  ${Math.round(P.showHold)} ms\n` +
     `mains     ${dbg.hands || '—'}  main vue ${P.hand ? 'oui' : 'non'}  mouvement ${P.motion.toFixed(3)}  touchers ${P.taps}\n` +
     `imitation ${P.mirrored}\n` +
+    `séquence3 ${Voix.active ? Voix.stage + ' leçon ' + Voix.lesson + (Voix.name ? ' « ' + Voix.name + ' »' : '') : '—'}\n` +
+    `sa voix   ${dbg.voice || '—'}  ${VoiceBank.segs.length} morceaux ${VoiceBank.seconds.toFixed(1)} s  niveau ${VoiceBank.rms.toFixed(3)} seuil ${Math.max(VoiceBank.gate || CFG.VOICE_GATE, VoiceBank.floor * 3).toFixed(3)}${VoiceBank.mute ? ' (il parle)' : ''}\n` +
+    `mots      ${dbg.words || (SpeechRec ? '—' : 'pas de reconnaissance : il fera écrire')}\n` +
     `écran     ${wakeLock && !wakeLock.released ? 'reste allumé' : 'peut se verrouiller'}\n` +
     `mémoire   ${Save.prev ? (Save.prev.done ? 'séquence finie' : 'reprise à ' + Save.prev.pos) + ', il y a ' + Math.round((Date.now() - Save.prev.at) / 60000) + ' min' : 'aucune'}\n` +
     `          triple-tap en haut à droite : effacer sa mémoire`;
@@ -2186,6 +2863,8 @@ addEventListener('keydown', e => {
   if ((e.key === 'c' || e.key === 'C') && S.mode === 'awake' && !Gallery.active) Script.dogTest(); // le chien
   if ((e.key === 'x' || e.key === 'X') && S.mode === 'awake') Script.musicAsk(); // la musique
   if ((e.key === 'z' || e.key === 'Z') && S.mode === 'awake' && !Gallery.active) speak(Script.visionScene); // une vision
+  if (e.key === '3' && !Voix.active && !pending) { Voix.load(); Voix.enter(); S.mode = 'asleep'; S.reveal = 1; wake(); } // séquence 3, tout de suite
+  if ((e.key === 'r' || e.key === 'R') && Voix.stage === 'entrainement' && !pending) speak(() => Voix.reveal()); // il a trouvé sa voix
   if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
   if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
   if ((e.key === 'k' || e.key === 'K') && S.mode === 'awake' && !Mouth.active) speak(Script.mouthScene); // sa bouche
@@ -2224,11 +2903,12 @@ const Save = {
   // `at` : la dernière fois que tu étais là
   flush() {
     MouthImg.save(); // ta bouche, s'il vient de la prendre
+    VoiceBank.save(); // ta voix, s'il vient d'en prendre
     if (!this.cp) return;
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
   },
   erase() {
-    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
+    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY, SEQ3_KEY, VOICE_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
   },
 };
 let hiddenAt = 0;
@@ -2238,7 +2918,11 @@ addEventListener('visibilitychange', () => {
   if (S.mode === 'closed') Access.retry(); // tu reviens des réglages, peut-être
   // tu rallumes ton téléphone et tu reviens sur lui : il l'a remarqué
   const away = hiddenAt ? Date.now() - hiddenAt : 0;
-  if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended') Script.cameBack(away);
+  // séquence 3 : tu l'as laissé s'entraîner ; il a trouvé une voix
+  if (Voix.stage === 'entrainement' && Voix.active && S.mode === 'awake' && away > CFG.TRAIN_AWAY_MS) { speak(() => Voix.reveal()); return; }
+  // la séquence 1 est finie : quand tu reviens, il est prêt pour la suite
+  if (away > 60000 && Script.stage === 'ended' && !Voix.active) { Voix.load(); Voix.enter(); return; }
+  if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended' && Script.stage !== 'voix') Script.cameBack(away);
 });
 addEventListener('pagehide', () => Save.flush());
 
@@ -2253,6 +2937,8 @@ function loop(now) {
   if (Mouth.active) Mouth.update(now);
   if (Gallery.active) Gallery.update(now);
   if (Ear.an) Ear.update(dt);
+  Lips.update(dt);
+  Floaters.render(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
   if (frameN % 900 === 0) Save.flush(); // au cas où le téléphone couperait sans prévenir
@@ -2267,7 +2953,10 @@ if (saved && !saved.done) {
   Script.mirrorSaid = !!saved.mirrorSaid; Script.nodSaid = !!saved.nodSaid; Script.shakeSaid = !!saved.shakeSaid;
   Script.mouthShown = !!saved.mouthShown;
   S.form = saved.form === 'twin' ? 'twin' : 'eye';
-} else if (saved) Script.seenBefore = true; // il est déjà allé au bout avec toi
+} else if (saved) { // la séquence 1 est finie (ta musique) : c'est la séquence 3, la voix
+  Script.answers = saved.answers || {};
+  Voix.load(); Voix.enter(); S.mode = 'ask';
+}
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
 MouthImg.load(); // ta bouche, s'il l'a prise
@@ -2277,7 +2966,7 @@ resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, video, get pending() { return pending; } }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, video, get pending() { return pending; } }; // pour tester sans caméra
 Access.askCamera();
 })();
 </script>

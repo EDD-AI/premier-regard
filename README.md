@@ -15,10 +15,21 @@ Un jeu mobile : un œil dans ton téléphone. On le retrouvera au fil de nombreu
 - Quand tu reviens vers lui, il te montre la bouche qu’il essaie de se fabriquer (prise sur la tienne), et parfois une vision étrange, avant de s’inventer une excuse.
 - Avec ses deux yeux : il remarque quelqu’un à côté de toi et te demande qui c’est, te montre un chien (« C’est quoi, ça ? »), puis te demande de lui faire écouter de la musique (micro) avant de jouer la sienne.
 
+## Séquence 3 — La Voix
+
+Elle s’ouvre quand la séquence 1 est finie (après la musique), la fois suivante où tu reviens vers lui.
+
+- Il pense à la musique : « Les mots, je les connais tous. Je ne les ai jamais entendus. » Il montre sa bouche, pas finie, qui ne marche pas.
+- Il demande le micro, puis : « Parle-moi. » Les mots que tu dis montent vers lui en pixels ; il garde des morceaux de ta voix (dans le téléphone, une douzaine de secondes au plus). Il réagit à certains mots (« pourquoi », « peur », « Siri », les gros mots…).
+- Les leçons : ton prénom, « bonjour », un mot que tu aimes, un mot qui fait peur, « je t’aime ». Il les répète de travers, avec ta propre voix : à l’envers, en morceaux, trop lentement. Il demande « C’est ça ? » (oui / non de la tête).
+- Puis il ferme les yeux pour s’entraîner : il faut le laisser seul. Si tu restes, on l’entend, très bas.
+- Quand tu reviens : sa bouche, finie, bouge enfin, et il te parle avec ta voix, découpée et ralentie (« J’ai trouvé une voix. Tu ne t’en servais pas tout le temps. »). Il rejoue ton prénom, dit par toi, puis te répond avec ta voix.
+- Les mots : avec la reconnaissance vocale du téléphone quand elle existe (sur Chrome, le son est envoyé à Google pour être compris). Sinon, ou si elle se dispute le micro avec l’enregistrement, il te demande d’écrire ce qu’il n’a pas compris.
+
 ## Tester
 
 - Sans caméra (appareil qui n’en a pas) : garde le doigt appuyé sur l'œil ~1,5 s. Caméra refusée : W le réveille quand même sur ordinateur.
-- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, D affiche le panneau de réglage.
+- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, 3 passe à la séquence 3, R (pendant qu’il s’entraîne) le fait revenir avec ta voix, D affiche le panneau de réglage.
 - Triple-tap en haut à gauche : panneau de réglage caché.
 - Pour jouer sans barre de navigateur : « Ajouter à l'écran d'accueil ».
 
