@@ -113,6 +113,9 @@ const CFG = {
   VOICE_GATE: 0.012,    // séquence 3 : niveau minimal pour qu'il considère que tu parles (et 3× le bruit de ta pièce)
   VOICE_MAX_S: 12,      // secondes de ta voix qu'il garde dans le téléphone
   TRAIN_AWAY_MS: 20000, // absence qui lui suffit pour s'entraîner avec ta voix
+  PAUSE_AWAY_MS: 12000, // entre deux séquences : absence après laquelle la suite commence
+  PAUSE_TELL_MS: 25000, // devant le noir, il finit par te dire de partir…
+  PAUSE_GIVEUP_MS: 150000, // …puis revient de lui-même
   DARK_LIGHT: 0.08,     // séquence 4 : image assez noire pour qu'il ne voie plus rien…
   DARK_DIM: 0.22,       // …ou sombre et sans aucun détail (un doigt, la table : la caméra pousse le bruit, pas l'image)
   DARK_FLAT: 0.015,
@@ -471,7 +474,8 @@ function wake() {
   setTimeout(blink, 420); setTimeout(blink, 760);
   setTimeout(() => {
     S.mode = 'awake';
-    if (Monde.active) Monde.begin(); else if (Voix.active) Voix.begin(); else if (Script.resume) Script.welcomeBack(); else Script.intro();
+    const ch = chapters().find(c => c.active);
+    if (ch) ch.begin(); else if (Script.resume) Script.welcomeBack(); else Script.intro();
   }, 1100);
 }
 
@@ -2475,10 +2479,7 @@ const Script = {
     speak(async () => {
       await sleep(2400);
       await type('Je crois que je me souviens de quelque chose.'); await sleep(3000);
-      S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
-      await sleep(4500);
-      voice.textContent = '';
-      const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+      await Pause.start();
     });
   },
 };
@@ -2821,12 +2822,7 @@ const Voix = {
     this.stage = 'fin'; this.save();
     await sayNow(['Je garde la tienne.']); await sleep(2600);
     Lips.show(false);
-    // fin de la séquence : il se ferme, comme la première fois
-    Script.stage = 'ended';
-    S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
-    await sleep(4500);
-    voice.textContent = '';
-    const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+    await Pause.start(); // fin de la séquence : il se ferme, comme la première fois
   },
   // Les fois suivantes : il te parle avec ta voix, et te répète.
   async after() {
@@ -3064,11 +3060,7 @@ const Monde = {
   },
   async finish() {
     this.stage = 'fin'; this.save();
-    Script.stage = 'ended';
-    S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
-    await sleep(4500);
-    voice.textContent = '';
-    const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+    await Pause.start();
   },
   // Les fois suivantes.
   async after() {
@@ -3077,6 +3069,49 @@ const Monde = {
     await sayNow(awayLines(Date.now() - (this.at || Date.now()))); await sleep(2200);
     await sayNow(['Je repense au noir.', 'Ne me pose pas.']); await sleep(2400);
     this.at = Date.now(); this.save();
+  },
+};
+
+// ---------- les séquences, dans l'ordre (la 2 reste à écrire)
+// Chacune garde son étape dans le téléphone ; une fois la séquence 1 finie, on entre dans la première qui n'est pas finie.
+const chapters = () => [Voix, Monde];
+function nextChapter() {
+  const all = chapters();
+  all.forEach(c => c.load());
+  return all.find(c => c.stage !== 'fin') || all[all.length - 1];
+}
+function openChapter(ch) {
+  chapters().forEach(c => { c.active = false; });
+  ch.enter();
+}
+
+// ---------- entre deux séquences
+// Il se ferme, et l'écran devient noir. Il faut le laisser un moment : quand tu reviens (ou que tu rouvres la page),
+// la suite commence. Si tu restes devant le noir, il finit par te le dire, puis par revenir de lui-même.
+const Pause = {
+  on: false, t0: 0, step: 0,
+  async start() {
+    Script.stage = 'ended';
+    S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
+    await sleep(4500);
+    voice.textContent = '';
+    const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+    Object.assign(this, { on: true, t0: performance.now(), step: 0 });
+  },
+  update(now) {
+    if (!this.on || pending) return;
+    const t = now - this.t0;
+    if (this.step === 0 && t > CFG.PAUSE_TELL_MS) { this.step = 1; say(['Laisse-moi, maintenant.']); }
+    else if (this.step === 1 && t > CFG.PAUSE_TELL_MS * 2.4) { this.step = 2; say(['Tu es encore là.', 'Va-t’en un moment.', 'Reviens plus tard.']); }
+    else if (this.step === 2 && t > CFG.PAUSE_GIVEUP_MS) {
+      this.step = 3;
+      speak(async () => { await sayNow(['Tu ne pars pas.', '|', 'Alors je reviens.']); await sleep(2200); this.resume(); });
+    }
+  },
+  resume() { // la suite
+    if (!this.on) return;
+    this.on = false;
+    openChapter(nextChapter());
   },
 };
 
@@ -3152,7 +3187,7 @@ const Reactions = {
 
 function direct(dt, now) {
   if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
-  if (Script.stage === 'voix' || Script.stage === 'monde') return; // les séquences 3 et 4 mènent elles-mêmes la conversation
+  if (chapters().some(c => c.active)) return; // les séquences suivantes mènent elles-mêmes la conversation
   Reactions.update(dt);
   const task = Script.task;
   // quelqu'un à côté de toi : il arrive, il repart
@@ -3308,8 +3343,9 @@ addEventListener('keydown', e => {
   if ((e.key === 'c' || e.key === 'C') && S.mode === 'awake' && !Gallery.active) Script.dogTest(); // le chien
   if ((e.key === 'x' || e.key === 'X') && S.mode === 'awake') Script.musicAsk(); // la musique
   if ((e.key === 'z' || e.key === 'Z') && S.mode === 'awake' && !Gallery.active) speak(Script.visionScene); // une vision
-  if (e.key === '3' && !Voix.active && !pending) { Voix.load(); Voix.enter(); S.mode = 'asleep'; S.reveal = 1; wake(); } // séquence 3, tout de suite
-  if (e.key === '4' && !Monde.active && !pending) { Voix.load(); Monde.load(); Monde.enter(); S.mode = 'asleep'; S.reveal = 1; wake(); } // séquence 4
+  // 3, 4… : passer tout de suite à cette séquence
+  const ch = chapters()[+e.key - 3];
+  if (ch && !ch.active && !pending) { chapters().forEach(c => c.load()); Pause.on = false; openChapter(ch); S.mode = 'asleep'; S.reveal = 1; wake(); }
   if ((e.key === 'r' || e.key === 'R') && Voix.stage === 'entrainement' && !pending) speak(() => Voix.reveal()); // il a trouvé sa voix
   if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
   if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
@@ -3366,9 +3402,8 @@ addEventListener('visibilitychange', () => {
   const away = hiddenAt ? Date.now() - hiddenAt : 0;
   // séquence 3 : tu l'as laissé s'entraîner ; il a trouvé une voix
   if (Voix.stage === 'entrainement' && Voix.active && S.mode === 'awake' && away > CFG.TRAIN_AWAY_MS) { speak(() => Voix.reveal()); return; }
-  // la séquence 1 est finie : quand tu reviens, il est prêt pour la suite
-  if (away > 60000 && Script.stage === 'ended' && Voix.stage === 'fin' && !Monde.active) { Monde.load(); Monde.enter(); return; } // puis la 4
-  if (away > 60000 && Script.stage === 'ended' && !Voix.active && !Monde.active) { Voix.load(); Voix.enter(); return; }
+  // une séquence est finie : quand tu reviens, il est prêt pour la suite
+  if (Pause.on && away > CFG.PAUSE_AWAY_MS) { Pause.resume(); return; }
   if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended' && Script.stage !== 'voix') Script.cameBack(away);
 });
 addEventListener('pagehide', () => Save.flush());
@@ -3386,6 +3421,7 @@ function loop(now) {
   if (Ear.an) Ear.update(dt);
   Lips.update(dt);
   World.update(dt, frameN);
+  Pause.update(now);
   Floaters.render(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
@@ -3401,10 +3437,9 @@ if (saved && !saved.done) {
   Script.mirrorSaid = !!saved.mirrorSaid; Script.nodSaid = !!saved.nodSaid; Script.shakeSaid = !!saved.shakeSaid;
   Script.mouthShown = !!saved.mouthShown;
   S.form = saved.form === 'twin' ? 'twin' : 'eye';
-} else if (saved) { // la séquence 1 est finie (ta musique) : c'est la séquence 3, la voix
+} else if (saved) { // la séquence 1 est finie (ta musique) : la voix, puis le monde, puis la suite
   Script.answers = saved.answers || {};
-  Voix.load();
-  if (Voix.stage === 'fin') { Monde.load(); Monde.enter(); } else Voix.enter(); // et après la voix : le monde (séquence 4)
+  openChapter(nextChapter());
   S.mode = 'ask';
 }
 
@@ -3416,7 +3451,7 @@ resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, Monde, World, Motion, loadTracker, loadObjects, get objDetector() { return objDetector; }, video, get pending() { return pending; } }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, Monde, World, Motion, Pause, chapters, loadTracker, loadObjects, get objDetector() { return objDetector; }, video, get pending() { return pending; } }; // pour tester sans caméra
 Access.askCamera();
 })();
 </script>

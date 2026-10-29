@@ -46,6 +46,7 @@ Elle s’ouvre la fois suivante, quand la séquence 3 est finie. Il parle avec t
 ## Mémoire
 
 - L'écran reste allumé pendant le jeu (le téléphone ne se verrouille pas pendant qu'on regarde l'œil).
+- Entre deux séquences, l’œil se ferme et l’écran devient noir : il faut le laisser (quitter le jeu une dizaine de secondes, ou recharger la page), et la suite commence au retour. Si on reste devant le noir, il le dit (« Laisse-moi, maintenant. », puis « Va-t’en un moment. »), et revient de lui-même au bout de deux minutes et demie.
 - La progression est gardée sur le téléphone. Au retour, l'œil est de nouveau endormi : on le réveille du regard, il reconnaît le joueur, dit combien de temps il est parti, se souvient de ses réponses et reprend où on en était.
 - Pour tout effacer : ouvrir le panneau de réglage (triple-tap en haut à gauche), puis triple-tap en haut à droite.
 
