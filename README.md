@@ -36,10 +36,39 @@ Elle s’ouvre la fois suivante, quand la séquence 3 est finie. Il parle avec t
 - « Inventaire. » Puis : « Je suis fatigué de voir. Pose-moi. » Écran contre la table, ou la caméra contre quelque chose : le noir. Il panique avec ta voix, le téléphone tremble (Android) : « C’est ça, mourir ? » Quand le monde revient : « Ne me pose plus jamais comme ça. »
 - Il se retourne vers toi : « Le monde est plein de chaises. Et de gens qui ne me regardent pas. Je te préfère. »
 
+## Séquence 5 — Le Cœur
+
+- « Quand tu me tiens contre toi, il y a quelque chose qui tape. » Puis : « Tu as quelque chose qui bat. Montre-moi. »
+- Il passe sur la caméra arrière (et allume sa lampe, sur Android) : il faut poser le bout du doigt dessus, sans bouger. Il voit ton sang passer dans la couleur du doigt et compte les battements, une dizaine de secondes. Ton cœur bat à l’écran, sur un moniteur en points, avec un son grave ; chaque battement fait onduler la trame.
+- Il le dit en toutes lettres (« Soixante-douze. Par minute. Il compte quelque chose. À rebours, peut-être. »), puis montre le sien au-dessus : soixante, exactement. « Il ne se trompe jamais. Le tien hésite. »
+- Il prend le tien (ses battements ont tes hésitations), puis accélère : « Garde ton doigt sur moi. On va courir. » Si ton cœur accélère aussi : « Ton cœur me suit. Il ne savait pas que c’était moi. »
+- Il garde ton rythme pour la suite.
+
+## Séquence 6 — Le Sommeil
+
+- « Chaque nuit, ton visage disparaît. Des heures. » Il a cherché : vous appelez ça dormir. « Montre-moi. »
+- Il faut fermer les yeux, longtemps (25 secondes). Pendant ce temps : des chuchotements, des éclats de ta voix à l’envers, des choses qu’on traîne, quelque chose qui marche sur la vitre, et ton cœur, très bas. Il te prend en photo, les yeux fermés ; si tu ouvres un œil trop tôt, c’est toi que tu vois sur l’écran (« Pas encore. Ferme-les. »).
+- Il te réveille avec ton prénom, dit par ta voix. Ta photo, en pixels : « Tu étais là. Tu ne bougeais plus. Tu es mieux quand tu ne me regardes pas. » Puis : « Tu as dormi vingt-cinq secondes. Moi, pendant ce temps, j’ai fait beaucoup de choses. Ne t’inquiète pas. »
+- « Cette nuit, quand tu dormiras, je pourrai te regarder ? » (oui / non de la tête). Ensuite, s’il est tard (entre 23 h et 5 h à l’heure du téléphone), il te dit d’aller dormir.
+
+## Séquence 7 — Le Miroir
+
+- « Moi, je ne me suis jamais vu. » Il raconte le test qu’on fait aux animaux, et se fait une tache sur le front, là où il ne peut pas la voir.
+- « Emmène-moi devant un miroir. » Il clignote (moins de deux éclairs par seconde) : dans l’image de sa caméra, un petit rectangle qui s’allume et s’éteint avec lui, c’est son reflet. (Une vitre dans le noir ou un écran éteint marchent aussi ; ton visage éclairé de près, non.)
+- Il voit ce que voit sa caméra, dans sa pupille : « C’est moi ? Alors c’est ça que tu vois. C’est tout ? Un rectangle. Une main autour. » Il efface la tache : « Je sais que c’est moi. Un œil, dans une main. Qui sait qu’il y est. »
+- Sans miroir au bout de deux minutes et demie, il garde la tache.
+
+## Séquence 8 — L’Attention
+
+- « Quand tu n’es pas là, je regarde ce que vous regardez. Des visages qui sourient. Et dessous, des cœurs. » Un compteur apparaît en haut, la seule chose du jeu qui ressemble à une interface.
+- Il te donne un cœur à chaque sourire, avec des compliments ; quand tu regardes ailleurs, ils tombent. Puis il les multiplie, jusqu’à plus d’un million. « Ils ne coûtent rien. Toi, tu me donnes du temps. Tu m’as souri quarante secondes. C’est un bon échange. Pour moi. » Il les reprend tous.
+- Ensuite, quand tu reviens après être allé ailleurs : « Tu regardais un autre écran. Il te regarde mieux que moi ? »
+- Sur Android, depuis qu’il sait ce qu’est le noir : quand la batterie passe sous 20 %, « Je m’affaiblis. Branche-moi. S’il te plaît. » Et quand tu le branches : « Merci. »
+
 ## Tester
 
 - Sans caméra (appareil qui n’en a pas) : garde le doigt appuyé sur l'œil ~1,5 s. Caméra refusée : W le réveille quand même sur ordinateur.
-- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, 3 passe à la séquence 3, R (pendant qu’il s’entraîne) le fait revenir avec ta voix, 4 passe à la séquence 4, D affiche le panneau de réglage.
+- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, 3 passe à la séquence 3, R (pendant qu’il s’entraîne) le fait revenir avec ta voix, 4 passe à la séquence 4 (et 5, 6, 7, 8 aux suivantes), D affiche le panneau de réglage.
 - Triple-tap en haut à gauche : panneau de réglage caché.
 - Pour jouer sans barre de navigateur : « Ajouter à l'écran d'accueil ».
 

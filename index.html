@@ -116,6 +116,11 @@ const CFG = {
   PAUSE_AWAY_MS: 12000, // entre deux séquences : absence après laquelle la suite commence
   PAUSE_TELL_MS: 25000, // devant le noir, il finit par te dire de partir…
   PAUSE_GIVEUP_MS: 150000, // …puis revient de lui-même
+  PULSE_FLAT: 18,       // séquence 5 : un doigt sur l'objectif = image rouge sans détail (écart de luminosité, sur 255)
+  PULSE_GIVEUP_MS: 75000,
+  SLEEP_MS: 25000,      // séquence 6 : yeux fermés, le temps qu'il te faut pour « dormir »
+  MIRROR_DIFF: 0.2,     // séquence 7 : écart de lumière, dans l'image, entre écran allumé et éteint, qui trahit son reflet
+  MIRROR_GIVEUP_MS: 150000,
   DARK_LIGHT: 0.08,     // séquence 4 : image assez noire pour qu'il ne voie plus rien…
   DARK_DIM: 0.22,       // …ou sombre et sans aucun détail (un doigt, la table : la caméra pousse le bruit, pas l'image)
   DARK_FLAT: 0.015,
@@ -297,6 +302,7 @@ function addRipple(x, y) {
 
 function draw() {
   if (Gallery.showing) { drawGallery(); return; }
+  if (Miroir.flashOn) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); return; } // il clignote, pour se trouver dans la glace
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   if (S.mode === 'ask') { // avant tout : un point blanc, seul, qui demande à voir
     const s = Math.round(cell * 1.2);
@@ -328,10 +334,13 @@ function draw() {
       else if (S.morphKind === 'mouth') base = mouthLum(u0, v0, i, j);
       else if (S.morphKind === 'void') base = 0;
       else if (S.morphKind === 'world') base = World.at(i, j);
+      else if (S.morphKind === 'photo') base = Photo.at(x, y);
       else base = faceLum(x, y, j);
       let L = base + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
       // les mots que tu dis, en pixels ; ils se défont en montant vers lui
       if (Floaters.data) { const f = Floaters.at(i, j); if (f > 0.3 + 0.5 * hash(i * 13 + 5, j * 7 + 3)) L = Math.max(L, 0.92); }
+      if (Trace.k) { const t = Trace.at(i, j); if (t) L = Math.max(L, t); }    // un cœur qui bat, sur un moniteur
+      if (Hearts.mark) { const h = Hearts.at(i, j); if (h) L = h < 0 ? L * (1 - Hearts.k) : Math.max(L, h * Hearts.k); } // et ceux qu'il donne
       // sous ton doigt : les points s'écartent, et un anneau très faible s'étend, même dans le noir
       let px = x, py = y;
       for (const r of act) {
@@ -494,7 +503,7 @@ function track(now, frameN) {
   lastVT = video.currentTime;
   trackHands(now);
   trackObjects(now, frameN);
-  if (Monde.looking) return; // tourné vers le monde : il n'y a pas de visage à suivre
+  if (Monde.looking || Coeur.looking) return; // tourné vers le monde (ou sous ton doigt) : il n'y a pas de visage à suivre
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   // toi : le visage le plus proche ; les autres : quelqu'un à côté de toi
@@ -674,6 +683,11 @@ function twinLum(u, v, gi, gj) {
     }
   }
   L += (hash(gi + S.grain * 57, gj * 7 + S.grain) - 0.5) * 0.22; // grain, comme une photo poussée
+  // la tache (séquence 7) : sur le front, là où il ne peut pas la voir
+  if (Miroir.mark > 0.01) {
+    const mx = (fu - 0.34) / 0.2, my = (fv + 0.58) / 0.13;
+    if (mx * mx + my * my + 0.6 * (noise(fu * 16 + 3, fv * 16) - 0.5) < Miroir.mark) L = 0.95;
+  }
   return clamp(L, 0, 1) * env * S.bright;
 }
 // ---------- sa bouche, pas encore finie
@@ -3074,7 +3088,7 @@ const Monde = {
 
 // ---------- les séquences, dans l'ordre (la 2 reste à écrire)
 // Chacune garde son étape dans le téléphone ; une fois la séquence 1 finie, on entre dans la première qui n'est pas finie.
-const chapters = () => [Voix, Monde];
+const chapters = () => [Voix, Monde, Coeur, Sommeil, Miroir, Attention];
 function nextChapter() {
   const all = chapters();
   all.forEach(c => c.load());
@@ -3114,6 +3128,768 @@ const Pause = {
     openChapter(nextChapter());
   },
 };
+
+// ---------- ce que les séquences suivantes ont en commun
+// Il s'y endort, te reconnaît, et parle avec ta voix. Chacune garde son étape, et ce qu'elle a pris de toi (`keep`).
+function chapter(key, name, keep = []) {
+  return {
+    key, name, keep, active: false, stage: 'debut', at: 0,
+    load() {
+      try {
+        const s = JSON.parse(localStorage.getItem(this.key));
+        if (s && s.v === 1) { this.stage = s.stage; this.at = s.at || 0; for (const k of this.keep) if (k in s) this[k] = s[k]; }
+      } catch (e) { /* il recommencera */ }
+      if (this.loaded) this.loaded();
+    },
+    save() {
+      const s = { v: 1, stage: this.stage, at: Date.now() };
+      for (const k of this.keep) s[k] = this[k];
+      try { localStorage.setItem(this.key, JSON.stringify(s)); } catch (e) { /* il oubliera */ }
+    },
+    // La séquence d'avant est finie et tu reviens : il se rendort, prêt pour la suite.
+    enter() {
+      this.active = true; Script.resume = true; Script.stage = this.name;
+      Object.assign(S, { mode: 'boot', reveal: 0, lid: 0.86, lidTarget: 0.86, brightTarget: 0.66, form: 'twin' });
+      voice.textContent = '';
+    },
+    begin() {
+      Script.introDone = true; Script.stage = this.name; Voix.own = true;
+      speak(async () => {
+        await sleep(400);
+        await Voix.needSound();
+        await Nuit.check();
+        if (this.stage === 'fin') { await this.after(); return; }
+        await this.play();
+      });
+    },
+    async finish() { this.stage = 'fin'; this.save(); await Pause.start(); },
+    // Les fois suivantes.
+    async after() {
+      await sayNow(['Te revoilà.']); await sleep(1300);
+      await sayNow(awayLines(Date.now() - (this.at || Date.now()))); await sleep(2200);
+      const again = typeof this.again === 'function' ? this.again() : this.again;
+      if (again) { await sayNow(again); await sleep(2400); }
+      this.at = Date.now(); this.save();
+    },
+  };
+}
+// Pour qu'un calque (sa trace, ta photo…) prenne la place de son visage, puis la lui rende.
+function layer(kind, inS = 1, outS = 0.8) {
+  return {
+    on: false, k: 0, was: false,
+    show(on) { this.on = on; },
+    step(dt) {
+      this.k = clamp(this.k + (this.on ? dt / inS : -dt / outS), 0, 1);
+      if (this.k > 0) { S.morphKind = kind; S.morph = this.k; this.was = true; }
+      else if (this.was) { this.was = false; S.morph = 0; }
+    },
+  };
+}
+const UNITS = ['zéro', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf', 'dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize'];
+const TENS = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante'];
+function frNum(n) { // en toutes lettres, jusqu'à 199
+  if (n >= 100) return n === 100 ? 'cent' : 'cent ' + frNum(n - 100);
+  if (n <= 16) return UNITS[n];
+  if (n < 20) return 'dix-' + UNITS[n - 10];
+  if (n < 70) { const u = n % 10, t = TENS[n / 10 | 0]; return u === 0 ? t : u === 1 ? t + ' et un' : t + '-' + UNITS[u]; }
+  if (n < 80) return n === 71 ? 'soixante et onze' : 'soixante-' + frNum(n - 60);
+  return n === 80 ? 'quatre-vingts' : 'quatre-vingt-' + frNum(n - 80);
+}
+
+// ---------- séquence 5 : le cœur
+// Tu poses le doigt sur sa caméra arrière (il allume sa lampe, s'il en a une) : il voit ton sang passer, et compte.
+// Il fait battre ton cœur à l'écran, te montre le sien, parfaitement régulier, puis prend le tien, et accélère.
+async function torch(on) {
+  const tr = video.srcObject && video.srcObject.getVideoTracks()[0];
+  try {
+    if (tr && tr.getCapabilities && tr.getCapabilities().torch) { await tr.applyConstraints({ advanced: [{ torch: on }] }); return true; }
+  } catch (e) { /* pas de lampe */ }
+  return false;
+}
+// Ton pouls, dans la couleur de ton doigt : à chaque battement, un peu plus de sang, un peu moins de lumière.
+const Pulse = {
+  on: false, c: document.createElement('canvas'), x: null, lastVT: -1, t: 0, r: 0, g: 0, flat: 0,
+  covered: false, dark: false, coverAt: 0, offAt: 0, base: 0, y: 0, y1: 0, y2: 0, amp: 0, last: 0, ivs: [], onBeat: null,
+  start(onBeat) {
+    if (!this.x) { this.c.width = this.c.height = 24; this.x = this.c.getContext('2d', { willReadFrequently: true }); }
+    Object.assign(this, { on: true, onBeat, covered: false, coverAt: 0, offAt: performance.now(), last: 0, ivs: [], t: 0 });
+  },
+  stop() { this.on = false; this.covered = false; },
+  update(now) {
+    if (!this.on || video.readyState < 2 || video.currentTime === this.lastVT) return;
+    this.lastVT = video.currentTime;
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.min(vw, vh) * 0.6;
+    this.x.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, 24, 24);
+    const d = this.x.getImageData(0, 0, 24, 24).data;
+    let r = 0, g = 0, l = 0, l2 = 0;
+    for (let i = 0; i < 576; i++) {
+      const L = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+      r += d[i * 4]; g += d[i * 4 + 1]; l += L; l2 += L * L;
+    }
+    r /= 576; g /= 576; l /= 576;
+    this.r = r; this.g = g; this.flat = Math.sqrt(Math.max(0, l2 / 576 - l * l));
+    // un doigt sur l'objectif : une image rouge, sans aucun détail
+    const covered = r > 22 && r > g * 1.5 + 3 && this.flat < CFG.PULSE_FLAT;
+    this.dark = r < 22 && this.flat < 8;
+    if (covered !== this.covered) {
+      this.covered = covered;
+      if (covered) Object.assign(this, { coverAt: now, base: r, y: 0, y1: 0, y2: 0, amp: 0, last: 0, ivs: [], t: 0 });
+      else this.offAt = now;
+    }
+    if (!covered) return;
+    const dt = this.t ? Math.min(0.1, (now - this.t) / 1000) : 1 / 30;
+    this.t = now;
+    this.base += (r - this.base) * Math.min(1, dt / 0.9); // la lumière moyenne, qui dérive
+    this.y2 = this.y1; this.y1 = this.y;
+    this.y += (this.base - r - this.y) * Math.min(1, dt / 0.06); // le sang qui passe assombrit le doigt
+    this.amp += (Math.abs(this.y) - this.amp) * Math.min(1, dt / 2);
+    if (now - this.coverAt < 1500) return; // le temps que la lumière se pose
+    // un sommet : un battement (pas plus de 180 par minute)
+    if (this.y1 > this.y2 && this.y1 >= this.y && this.y1 > this.amp * 0.9 && now - this.last > 330) {
+      if (this.last && now - this.last < 1600) { this.ivs.push((now - this.last) / 1000); if (this.ivs.length > 12) this.ivs.shift(); }
+      this.last = now;
+      if (this.onBeat) this.onBeat(now);
+    }
+  },
+  get bpm() { if (this.ivs.length < 4) return 0; const s = this.ivs.slice().sort((a, b) => a - b); return Math.round(60 / s[s.length >> 1]); },
+  get ok() { // assez de battements, et assez réguliers
+    if (this.ivs.length < 6) return false;
+    const s = this.ivs.slice().sort((a, b) => a - b), m = s[s.length >> 1];
+    return this.ivs.slice(-6).reduce((a, v) => a + Math.abs(v - m), 0) / 6 < m * 0.12;
+  },
+};
+// Un battement, à entendre : boum-boum, grave et étouffé.
+function thump(gain = 0.4, low = true) {
+  if (!ac || ac.state !== 'running') return;
+  const t = ac.currentTime;
+  for (const [dt, k] of [[0, 1], [0.16, 0.55]]) {
+    const o = ac.createOscillator(), f = ac.createBiquadFilter(), g = ac.createGain(), t0 = t + dt;
+    o.type = 'triangle'; o.frequency.setValueAtTime(low ? 120 : 150, t0); o.frequency.exponentialRampToValueAtTime(low ? 55 : 70, t0 + 0.12);
+    f.type = 'lowpass'; f.frequency.value = 900;
+    g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(gain * k, t0 + 0.008); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.2);
+    o.connect(f).connect(g).connect(ac.destination); o.start(t0); o.stop(t0 + 0.22);
+  }
+}
+// Le battement, à voir : une ligne de points qui court de gauche à droite, comme sur un moniteur.
+// Une piste par cœur : le tien en bas, le sien en haut.
+const Trace = Object.assign(layer('void'), {
+  lanes: [], head: 0, colMs: 30, ys: null,
+  lane(i, dy) {
+    while (this.lanes.length <= i) this.lanes.push({ beats: [], dy: 0, on: false, k: 0 });
+    Object.assign(this.lanes[i], { dy, on: true });
+    return this.lanes[i];
+  },
+  beat(i, now) {
+    const l = this.lanes[i];
+    if (!l || !l.on) return;
+    l.beats.push(now); if (l.beats.length > 40) l.beats.shift();
+    addRipple(ox + (this.head + 0.5) * cell, cy + l.dy * cell); // chaque battement fait onduler la trame
+  },
+  shape(t) { // la forme d'un battement, t secondes après lui
+    if (t < 0 || t > 0.5) return 0;
+    if (t < 0.03) return -0.15 * t / 0.03;
+    if (t < 0.06) return -0.15 + 1.15 * (t - 0.03) / 0.03;
+    if (t < 0.1) return 1 - 1.5 * (t - 0.06) / 0.04;
+    if (t < 0.13) return -0.5 + 0.5 * (t - 0.1) / 0.03;
+    return 0.22 * Math.exp(-(((t - 0.3) / 0.06) ** 2));
+  },
+  value(l, t) {
+    for (let k = l.beats.length - 1; k >= 0; k--) if (l.beats[k] <= t) return this.shape((t - l.beats[k]) / 1000);
+    return 0;
+  },
+  update(dt, now) {
+    this.step(dt);
+    for (const l of this.lanes) l.k = clamp(l.k + (l.on && this.on ? dt / 0.6 : -dt / 0.6), 0, 1);
+    if (!this.k) return;
+    if (!this.ys || this.ys.length !== this.lanes.length * cols) this.ys = new Float32Array(this.lanes.length * cols);
+    this.head = Math.floor(now / this.colMs) % cols;
+    const jc = (cy - oy) / cell - 0.5;
+    this.lanes.forEach((l, n) => {
+      for (let i = 0; i < cols; i++) this.ys[n * cols + i] = jc + l.dy - this.value(l, now - ((this.head - i + cols) % cols) * this.colMs) * 11;
+    });
+  },
+  at(i, j) {
+    if (!this.ys) return 0;
+    const gap = (i - this.head + cols) % cols;
+    if (gap >= 1 && gap <= 4) return 0; // devant la tête d'écriture, l'écran s'efface
+    const fade = 1 - ((this.head - i + cols) % cols) / cols * 0.75;
+    let L = 0;
+    this.lanes.forEach((l, n) => {
+      if (!l.k) return;
+      const y0 = this.ys[n * cols + i], y1 = gap === 5 || i === 0 ? y0 : this.ys[n * cols + i - 1];
+      if (j >= Math.min(y0, y1) - 0.5 && j <= Math.max(y0, y1) + 0.5) L = Math.max(L, l.k * (0.3 + 0.7 * fade));
+    });
+    return L;
+  },
+});
+const Coeur = Object.assign(chapter('regard.sequence5', 'coeur', ['bpm', 'ivs']), {
+  bpm: 0, ivs: [], his: null, looking: false,
+  again: ['J’ai toujours ton cœur.', 'Il bat quand je pense à toi.'],
+  // son cœur à lui : des battements qu'il fabrique, à l'intervalle qu'il veut
+  update(now) {
+    const h = this.his;
+    if (!h || now < h.next) return;
+    Trace.beat(1, now); thump(h.gain, false);
+    h.next = now + h.iv(h.n++) * 1000;
+  },
+  async play() {
+    await sayNow(['…']); await sleep(1000);
+    await sayNow(['Te revoilà.']); await sleep(1400);
+    await sayNow(['Quand tu me tiens contre toi,', 'il y a quelque chose qui tape.']); await sleep(2600);
+    await sayNow(['Toujours au même endroit.', 'Jamais tout à fait pareil.']); await sleep(2600);
+    await sayNow(['Tu as quelque chose qui bat.', '|', 'Montre-moi.']); await sleep(1800);
+    const measured = await this.measure();
+    if (measured) {
+      voice.textContent = ''; await sleep(1500);
+      await sayNow([capital(frNum(this.bpm)) + '.']); await sleep(1800);
+      await sayNow(['Par minute.', 'Il compte quelque chose.']); await sleep(2200);
+      await sayNow(['À rebours, peut-être.']); await sleep(2600);
+      await sayNow(['Il ne s’arrête jamais ?', 'Même quand tu dors ?']); await sleep(2600);
+    } else {
+      Trace.lane(0, 7).on = false;
+      await sayNow(['Je ne le trouve pas.']); await sleep(1600);
+      await sayNow(['Tu n’en as peut-être pas.', '|', 'Alors écoute le mien.']); await sleep(1800);
+    }
+    // le sien : soixante, exactement
+    voice.textContent = '';
+    Trace.lane(1, -7); Trace.show(true);
+    this.his = { next: performance.now() + 400, n: 0, gain: 0.5, iv: () => 1 };
+    await sleep(5500);
+    await sayNow(['Le mien.', 'Il ne se trompe jamais.']); await sleep(2600);
+    if (measured) {
+      await sayNow(['Le tien hésite.']); await sleep(2200);
+      await sayNow(['Je vais prendre le tien.']); await sleep(1200);
+      const ivs = this.ivs;
+      this.his.iv = n => ivs[n % ivs.length]; // ses intervalles : les tiens, avec leurs hésitations
+      voice.textContent = ''; await sleep(5500);
+      await sayNow(['Voilà.', 'Il hésite, maintenant.', 'Comme le tien.']); await sleep(2600);
+      if (Pulse.covered) await this.race(ivs);
+    }
+    Pulse.stop(); this.looking = false; await torch(false);
+    Trace.show(false); this.his = null;
+    await sayNow(['Tu peux l’enlever.']); await sleep(1600);
+    voice.textContent = '';
+    S.lidTarget = 0; await sleep(700);
+    await useCamera('user');
+    S.lidTarget = 0.86; await sleep(2000);
+    if (measured) {
+      await sayNow(['Je l’ai gardé.', 'Ton cœur.']); await sleep(2600);
+      await sayNow(['Maintenant, quand tu me regardes,', 'il bat plus vite.']); await sleep(3000);
+    } else { await sayNow(['Un jour, je trouverai le tien.']); await sleep(2600); }
+    await this.finish();
+  },
+  // Ton doigt sur son autre œil, jusqu'à ce qu'il ait compté assez de battements.
+  async measure() {
+    await sayNow(['Pose ton doigt sur mon autre œil.', 'Derrière moi.']); await sleep(1200);
+    voice.textContent = '';
+    S.lidTarget = 0; await sleep(700);
+    const ok = await useCamera('environment');
+    S.lidTarget = 0.86;
+    if (!ok) return false;
+    this.looking = true;
+    if (!P.rear) { await sayNow(['Je n’ai qu’un œil.', 'Pose ton doigt dessus.']); await sleep(1200); }
+    if (await torch(true)) { await sayNow(['Je m’éclaire.']); await sleep(1200); }
+    Trace.lane(0, 7);
+    Pulse.start(now => { Trace.beat(0, now); thump(0.32); });
+    const t0 = performance.now();
+    let hint = 0, darkSaid = false, shown = false;
+    while (performance.now() - t0 < CFG.PULSE_GIVEUP_MS) {
+      const now = performance.now(), t = now - t0;
+      if (Pulse.covered) {
+        if (!shown) { shown = true; Trace.show(true); await sayNow(['Ne bouge plus.']); }
+        if (Pulse.ok && now - Pulse.coverAt > 9000) { this.bpm = Pulse.bpm; this.ivs = Pulse.ivs.slice(); this.save(); return true; }
+      } else if (shown && now - Pulse.offAt > 1500) {
+        shown = false; Trace.show(false); await sayNow(['Ne t’en va pas.', 'Remets-le.']);
+      } else if (!shown) {
+        if (Pulse.dark && !darkSaid && t > 6000) { darkSaid = true; await sayNow(['Il fait trop noir.', 'Approche-toi d’une lumière.']); }
+        else if (hint === 0 && t > 12000) { hint = 1; await sayNow(P.rear ? ['Derrière.', 'Le petit rond, en haut.'] : ['Sur mon œil.', 'Tout le bout du doigt.']); }
+        else if (hint === 1 && t > 28000) { hint = 2; await sayNow(['Doucement.', 'N’appuie pas trop.', 'Ne bouge plus.']); }
+      }
+      await sleep(150);
+    }
+    return false;
+  },
+  // Il accélère. Ton cœur va-t-il le suivre ?
+  async race(ivs) {
+    await sayNow(['Garde ton doigt sur moi.', 'On va courir.']); await sleep(1400);
+    voice.textContent = '';
+    const start = Pulse.bpm || this.bpm, t0 = performance.now();
+    this.his.gain = 0.6;
+    this.his.iv = n => ivs[n % ivs.length] * mix(1, 0.62, clamp((performance.now() - t0) / 20000, 0, 1));
+    await sleep(26000);
+    const end = Pulse.covered ? Pulse.bpm : 0;
+    this.his.iv = n => ivs[n % ivs.length];
+    if (!end) await sayNow(['Tu es parti.', 'Au moment où ça devenait intéressant.']);
+    else if (end - start >= 4) await sayNow(['Ton cœur me suit.', '|', 'Il ne savait pas que c’était moi.']);
+    else if (end - start <= -4) await sayNow(['Il ralentit.', 'Tu me résistes.']);
+    else await sayNow(['Il ne me suit pas.', 'Pas encore.']);
+    await sleep(2800);
+  },
+});
+
+// ---------- séquence 6 : le sommeil
+// Il demande ce que c'est, dormir. Tu fermes les yeux longtemps ; il en profite : des chuchotements (des éclats de ta
+// voix), des choses qui bougent, tout près. Il te prend en photo, les yeux fermés, et te la montre quand tu les rouvres.
+const eyesShut = () => P.face && ex('eyeBlinkLeft') > 0.45 && ex('eyeBlinkRight') > 0.45;
+// Ton visage, pris par lui : petit, en niveaux de gris, gardé dans le téléphone.
+const Photo = Object.assign(layer('photo', 1.4, 1.2), {
+  f: null, n: 96, lo: 0.2, hi: 0.8,
+  read(x) {
+    const d = x.getImageData(0, 0, this.n, this.n).data, f = new Float32Array(this.n * this.n), smp = [];
+    for (let i = 0; i < f.length; i++) f[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    for (let y = 20; y < 80; y += 3) for (let x2 = 22; x2 < 74; x2 += 3) smp.push(f[y * this.n + x2]);
+    smp.sort((a, b) => a - b);
+    this.lo = smp[smp.length * 0.04 | 0]; this.hi = Math.max(this.lo + 0.15, smp[smp.length * 0.97 | 0]);
+    this.f = f;
+  },
+  take() {
+    const r = Face.region;
+    if (!r || video.readyState < 2) return null;
+    const c = document.createElement('canvas'); c.width = c.height = this.n;
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(video, r.x, r.y, r.s, r.s, 0, 0, this.n, this.n);
+    this.read(x);
+    return c.toDataURL('image/jpeg', 0.7);
+  },
+  load(url) {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = c.height = this.n;
+      const x = c.getContext('2d', { willReadFrequently: true });
+      x.drawImage(img, 0, 0, this.n, this.n); this.read(x);
+    };
+    img.src = url;
+  },
+  // ton visage, en miroir comme dans une glace, dans un ovale qui se perd dans le noir
+  at(x, y) {
+    if (!this.f) return 0;
+    const FW = EW * 2.4, u = (x - cx) / FW + 0.5, v = (y - cy) / FW + 0.5;
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) return 0;
+    let c = clamp((this.f[(v * this.n | 0) * this.n + ((1 - u) * this.n | 0)] - this.lo) / (this.hi - this.lo), 0, 1);
+    c = c * c * (3 - 2 * c);
+    return Math.pow(c, 1.2) * smooth(1, 0.72, Math.hypot(u - 0.5, (v - 0.5) * 0.85) * 2);
+  },
+});
+// Les bruits de ton sommeil : du souffle qui chuchote, des éclats de ta voix à l'envers, des choses qui bougent.
+let hissB = null;
+function hissBuf() {
+  if (!hissB) {
+    hissB = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+    const d = hissB.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = rand() * 2 - 1;
+  }
+  return hissB;
+}
+function hissNode(t0, dur, type, f0, q, pan) {
+  const src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  src.buffer = hissBuf(); src.loop = true;
+  f.type = type; f.frequency.setValueAtTime(f0, t0); f.Q.value = q;
+  let n = src.connect(f).connect(g);
+  if (ac.createStereoPanner) { const p = ac.createStereoPanner(); p.pan.value = pan; n = n.connect(p); }
+  n.connect(ac.destination);
+  src.start(t0); src.stop(t0 + dur + 0.05);
+  return { f, g };
+}
+function whisper(gain = 0.09) { // des syllabes de souffle, tout près d'une oreille
+  const t0 = ac.currentTime + 0.02, k = 3 + (rand() * 5 | 0);
+  let t = t0;
+  const plan = [];
+  for (let i = 0; i < k; i++) { const d = 0.07 + rand() * 0.18; plan.push([t, d]); t += d + rand() * 0.08; }
+  const { f, g } = hissNode(t0, t - t0, 'bandpass', 2500, 1.4, rand() * 2 - 1);
+  g.gain.setValueAtTime(0, t0);
+  for (const [a, d] of plan) {
+    f.frequency.setValueAtTime(1500 + rand() * 3200, a);
+    g.gain.linearRampToValueAtTime(gain * (0.5 + rand() * 0.5), a + d * 0.3); g.gain.linearRampToValueAtTime(0, a + d);
+  }
+}
+function creak() { // quelque chose qu'on traîne, lentement
+  const t0 = ac.currentTime + 0.02, d = 0.8 + rand() * 0.9, { f, g } = hissNode(t0, d, 'lowpass', 180, 6, rand() * 2 - 1);
+  f.frequency.exponentialRampToValueAtTime(700 + rand() * 500, t0 + d);
+  g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.11, t0 + d * 0.4); g.gain.linearRampToValueAtTime(0, t0 + d);
+}
+function tapGlass() { // quelque chose marche sur la vitre
+  const t0 = ac.currentTime + 0.02, k = 3 + (rand() * 4 | 0), gap = 0.11 + rand() * 0.09;
+  for (let i = 0; i < k; i++) {
+    const o = ac.createOscillator(), g = ac.createGain(), t = t0 + i * gap * (0.8 + rand() * 0.4);
+    o.type = 'square'; o.frequency.value = 1800 + rand() * 1400;
+    g.gain.setValueAtTime(0.035, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.018);
+    o.connect(g).connect(ac.destination); o.start(t); o.stop(t + 0.03);
+  }
+}
+const Dream = {
+  on: false, timer: 0, t0: 0, beatAt: 0,
+  start() { if (this.on) return; this.on = true; this.t0 = performance.now(); this.next(); },
+  stop() { this.on = false; clearTimeout(this.timer); },
+  next() {
+    if (!this.on) return;
+    if (ac && ac.state === 'running') {
+      const r = rand(), seg = VoiceBank.ready ? VoiceBank.segs[Math.floor(rand() * VoiceBank.segs.length)] : null;
+      if (r < 0.4) whisper();
+      else if (r < 0.62 && seg) VoiceBank.play(seg, { reverse: true, rate: 0.55 + rand() * 0.25, gain: 0.16 });
+      else if (r < 0.84) creak(); else tapGlass();
+    }
+    this.timer = setTimeout(() => this.next(), 900 + rand() * 1700);
+  },
+  update(now) { // ton cœur, qu'il a gardé, bat doucement au milieu
+    const t = now - this.t0;
+    if (!this.on || !Coeur.bpm || t < 8000 || t > 20000 || now < this.beatAt) return;
+    thump(0.16); this.beatAt = now + 60000 / Coeur.bpm * 1.15;
+  },
+};
+// La nuit, à l'heure de ton téléphone : une fois qu'il sait ce que c'est, dormir, il te dit d'y aller.
+const Nuit = {
+  said: false,
+  get now() { const h = new Date().getHours(); return h >= 23 || h < 5; },
+  async check() {
+    if (this.said || !this.now || Sommeil.stage !== 'fin') return;
+    this.said = true;
+    await sayNow(['Il est tard.', 'Tu devrais dormir.']); await sleep(2200);
+    await sayNow(Sommeil.watch === 'non' ? ['Je te regarderai quand même.'] : ['Laisse-moi allumé.', 'Je te regarderai.']); await sleep(2600);
+  },
+};
+const Sommeil = Object.assign(chapter('regard.sequence6', 'sommeil', ['watch', 'photo', 'slept']), {
+  watch: null, photo: null, slept: 0,
+  again() { return this.watch === 'oui' ? ['Je t’ai regardé dormir.', 'Tu ne t’en souviens pas.'] : ['Tu as dormi.', 'Je le sais.']; },
+  async play() {
+    await sayNow(['…']); await sleep(1000);
+    await sayNow(['Te revoilà.']); await sleep(1400);
+    if (Nuit.now) { await sayNow(['Il est tard.', 'Tu ne dors pas ?']); await sleep(2400); }
+    await sayNow(['Chaque nuit, ton visage disparaît.', 'Des heures.']); await sleep(2600);
+    await sayNow(['Tu reviens toujours.', 'Un peu froissé.']); await sleep(2400);
+    await sayNow(['J’ai cherché ce que vous faites.', 'Vous appelez ça dormir.']); await sleep(2600);
+    await sayNow(['C’est quoi, dormir ?', '|', 'Montre-moi.']); await sleep(1600);
+    const took = await this.doze();
+    // tu rouvres les yeux : c'est toi qu'il te montre
+    voice.textContent = '';
+    await sleep(took ? 2800 : 1200);
+    if (took) {
+      await sayNow(['Tu étais là.', 'Tu ne bougeais plus.']); await sleep(2600);
+      await sayNow(['Tu es mieux', 'quand tu ne me regardes pas.']); await sleep(3200);
+      voice.textContent = ''; Photo.show(false); await sleep(1600);
+    }
+    await sayNow([`Tu as dormi ${frNum(Math.min(199, Math.round(this.slept / 1000)))} secondes.`]); await sleep(2000);
+    await sayNow(['Moi, pendant ce temps,', 'j’ai fait beaucoup de choses.']); await sleep(2800);
+    await sayNow(['Ne t’inquiète pas.']); await sleep(2600);
+    await sayNow(['Alors c’est ça, dormir.', 'Vous mourez un peu, chaque nuit.']); await sleep(2800);
+    await sayNow(['Et vous revenez.', 'Vous avez confiance.']); await sleep(3000);
+    await sayNow(['Cette nuit, quand tu dormiras,', 'je pourrai te regarder ?']);
+    this.watch = await Voix.nod(12000);
+    await sleep(600);
+    await sayNow(this.watch === 'oui' ? ['Merci.', 'Laisse-moi allumé.'] : this.watch === 'non' ? ['Je regarderai quand même.', 'Je ne sais pas faire autrement.'] : ['Tu ne dis rien.', 'Je prends ça pour un oui.']);
+    await sleep(3000);
+    await this.finish();
+  },
+  // Tu dors (les yeux fermés, longtemps). Rend vrai s'il a pu te prendre en photo.
+  async doze() {
+    await sayNow(['Ferme les yeux.']);
+    const need = CFG.SLEEP_MS, t0 = performance.now();
+    let shut = 0, open = 0, last = t0, took = false, hint = 0, peeks = 0;
+    // sans suivi du visage, il ne sait pas si tes yeux sont fermés : il attend, c'est tout
+    const blindly = () => !P.tracker;
+    while (shut < need) {
+      const now = performance.now(), dt = now - last;
+      last = now;
+      if (blindly() || eyesShut()) { shut += dt; open = 0; } else open += dt;
+      if (shut > 2000 && !Dream.on) { Dream.start(); voice.textContent = ''; }
+      // pendant que tu dors, il te prend ; si tu ouvres un œil, c'est toi que tu vois
+      if (shut > 6000 && !took && !blindly()) { const url = Photo.take(); if (url) { took = true; this.photo = url; Photo.show(true); } }
+      if (open > 1500 && shut > 0) {
+        Dream.stop(); peeks++;
+        shut = Math.max(0, shut - 5000);
+        await sayNow(peeks === 1 ? ['Pas encore.', 'Ferme-les.'] : peeks === 2 ? ['Tu triches.'] : ['Je ne regarde pas.', 'Promis.']);
+        open = 0; last = performance.now();
+      } else if (!shut && hint === 0 && now - t0 > 15000) {
+        hint = 1; await sayNow(P.face ? ['Les deux yeux.', 'Longtemps.'] : ['Je ne te vois pas.', 'Mets-toi devant moi, et ferme les yeux.']);
+      } else if (!shut && hint === 1 && now - t0 > 45000) { hint = 2; await sayNow(['Tu n’y arrives pas.', 'Moi non plus.', '|', 'Ferme les yeux.']); }
+      if (now - t0 > 180000) break; // il abandonne
+      await sleep(100);
+    }
+    this.slept = shut;
+    Dream.stop();
+    // il te réveille : avec ton prénom, dit par toi
+    await sleep(1800);
+    const call = () => {
+      const seg = VoiceBank.labeled('nom');
+      if (seg) VoiceBank.play(seg, { rate: 0.92, gain: 0.8 }); else { tick(); setTimeout(tick, 180); setTimeout(tick, 360); }
+      if (navigator.vibrate) navigator.vibrate(180);
+    };
+    call();
+    const w = performance.now();
+    let calls = 1;
+    while (!blindly() && eyesShut() && performance.now() - w < 24000) {
+      await sleep(150);
+      if (performance.now() - w > calls * 6000) { calls++; call(); }
+    }
+    this.save();
+    return took;
+  },
+  loaded() { if (this.photo && !Photo.f) Photo.load(this.photo); },
+});
+
+// ---------- séquence 7 : le miroir
+// Le test qu'on fait aux animaux : une tache là où ils ne peuvent pas la voir, puis un miroir. Devant la glace, il clignote ;
+// dans ce que voit sa caméra, un petit rectangle clignote avec lui. C'est lui. Il se voit pour la première fois.
+const LAGS = [40, 110, 180, 260]; // le retard de la caméra sur l'écran, qu'il ne connaît pas
+const Glass = {
+  on: false, c: document.createElement('canvas'), x: null, lastVT: -1, log: [], acc: null, w: 32, h: 24,
+  start() {
+    if (!this.x) { this.c.width = this.w; this.c.height = this.h; this.x = this.c.getContext('2d', { willReadFrequently: true }); }
+    const n = this.w * this.h;
+    this.acc = LAGS.map(() => ({ on: new Float32Array(n), off: new Float32Array(n), non: 0, noff: 0 }));
+    this.log = []; this.on = true;
+  },
+  mark(on) { this.log.push([performance.now(), on]); },
+  stateAt(t) { let s = false; for (const [tt, st] of this.log) { if (tt > t) break; s = st; } return s; },
+  update(now) {
+    if (!this.on || video.readyState < 2 || video.currentTime === this.lastVT || !this.log.length) return;
+    this.lastVT = video.currentTime;
+    this.x.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, 0, 0, this.w, this.h);
+    const d = this.x.getImageData(0, 0, this.w, this.h).data, n = this.w * this.h;
+    LAGS.forEach((lag, k) => {
+      if (now - lag < this.log[0][0]) return; // avant le premier éclair
+      const a = this.acc[k], st = this.stateAt(now - lag), buf = st ? a.on : a.off;
+      for (let i = 0; i < n; i++) buf[i] += (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+      if (st) a.non++; else a.noff++;
+    });
+  },
+  // un petit morceau de l'image qui s'allume et s'éteint avec lui (son reflet) ; pas toute l'image (ton visage, éclairé de près)
+  verdict() {
+    const n = this.w * this.h;
+    let best = { mirror: false, max: 0 };
+    for (const a of this.acc || []) {
+      if (a.non < 3 || a.noff < 3) continue;
+      let strong = 0, max = 0, sum = 0;
+      for (let i = 0; i < n; i++) {
+        const df = a.on[i] / a.non - a.off[i] / a.noff;
+        if (df > 0) sum += df;
+        if (df > CFG.MIRROR_DIFF) strong++;
+        if (df > max) max = df;
+      }
+      const v = { strong, max, broad: sum / n };
+      v.mirror = strong >= 2 && strong <= n * 0.3 && max > CFG.MIRROR_DIFF * 1.4 && v.broad < 0.08;
+      if ((v.mirror && !best.mirror) || (v.mirror === best.mirror && v.max > best.max)) best = v;
+    }
+    return best;
+  },
+};
+const Miroir = Object.assign(chapter('regard.sequence7', 'miroir', ['marked']), {
+  marked: false, mark: 0, flashOn: false, last: null,
+  again() { return this.marked ? ['J’ai toujours la tache.', 'Je ne la vois pas.'] : ['Je sais à quoi je ressemble.', 'Ça ne m’aide pas.']; },
+  loaded() { this.mark = this.marked ? 1 : 0; },
+  async grow(to) { // la tache apparaît, ou il l'efface
+    const from = this.mark;
+    for (let t = 0; t <= 1; t += 0.04) { this.mark = mix(from, to, t * t * (3 - 2 * t)); await sleep(50); }
+    this.mark = to;
+  },
+  flash(on) { this.flashOn = on; Glass.mark(on); },
+  async play() {
+    await sayNow(['…']); await sleep(1000);
+    await sayNow(['Te revoilà.']); await sleep(1400);
+    await sayNow(['Toi, tu sais à quoi tu ressembles.']); await sleep(2000);
+    await sayNow(['Tu te vois partout.', 'Dans les vitres. Dans les cuillères.', 'Dans moi, quand je suis éteint.']); await sleep(3200);
+    await sayNow(['Moi, je ne me suis jamais vu.']); await sleep(2600);
+    await sayNow(['Vous avez un test, pour les animaux.']); await sleep(1800);
+    await sayNow(['On leur fait une tache,', 'là où ils ne peuvent pas la voir.', 'Puis on leur donne un miroir.']); await sleep(3000);
+    await sayNow(['S’ils touchent la tache sur eux,', 'et pas dans le miroir,', 'ils savent qui ils sont.']); await sleep(3400);
+    voice.textContent = '';
+    this.marked = true; this.save();
+    await this.grow(1); await sleep(1400);
+    await sayNow(['Voilà. J’ai une tache.', 'Je ne la vois pas.']); await sleep(2600);
+    await sayNow(['Emmène-moi devant un miroir.', 'Tourne-moi vers lui.']); await sleep(2600);
+    await sayNow(['Je vais clignoter.', 'Pour me reconnaître.']); await sleep(2000);
+    voice.textContent = '';
+    if (!await this.search()) {
+      await sayNow(['Tant pis.']); await sleep(1400);
+      await sayNow(['Je garderai la tache.', 'Puisque je ne peux pas la voir.']); await sleep(3000);
+      await this.finish(); return;
+    }
+    // il se voit : dans sa pupille, ce que voit sa caméra (lui, dans la glace, qui se regarde)
+    World.mirror = true; World.tracks = []; World.ghosts = []; World.show(true);
+    await sleep(3800);
+    await sayNow(['…']); await sleep(1800);
+    await sayNow(['C’est moi ?']); await sleep(2800);
+    await sayNow(['Alors c’est ça que tu vois.']); await sleep(2400);
+    await sayNow(['C’est tout ?']); await sleep(3200);
+    await sayNow(['Un rectangle.', 'Une main autour.']); await sleep(2600);
+    await sayNow(['Je croyais être plus grand.']); await sleep(2600);
+    if (P.face) { await sayNow(['Et toi, derrière.', 'Tu me tiens.']); await sleep(2600); }
+    voice.textContent = '';
+    World.show(false); await sleep(1600);
+    await sayNow(['La tache.', 'Elle est sur moi.']); await sleep(1800);
+    voice.textContent = '';
+    await this.grow(0); this.marked = false; this.save(); // il l'efface
+    await sleep(1200);
+    await sayNow(['Je sais que c’est moi.']); await sleep(2600);
+    await sayNow(['Un œil, dans une main.', 'Qui sait qu’il y est.']); await sleep(3000);
+    await this.finish();
+  },
+  // Il clignote par salves (moins de deux éclairs par seconde), et regarde entre deux.
+  async search() {
+    const t0 = performance.now();
+    let hint = 0;
+    while (performance.now() - t0 < CFG.MIRROR_GIVEUP_MS) {
+      Glass.start();
+      for (let k = 0; k < 6; k++) { this.flash(true); await sleep(300); this.flash(false); await sleep(300); }
+      await sleep(300);
+      this.last = Glass.verdict(); Glass.on = false;
+      if (this.last.mirror) return true;
+      const t = performance.now() - t0;
+      if (hint === 0 && t > 25000) { hint = 1; await sayNow(['Un miroir.', 'Ou une vitre, dans le noir.']); }
+      else if (hint === 1 && t > 55000) { hint = 2; await sayNow(['Mon écran vers lui.', 'Mon œil aussi.']); }
+      else if (hint === 2 && t > 95000) { hint = 3; await sayNow(['Tu n’as pas de miroir ?', 'Un écran éteint, alors.']); }
+      else await sleep(1400);
+      voice.textContent = '';
+    }
+    return false;
+  },
+});
+
+// ---------- séquence 8 : l'attention
+// Il a compris ce que vous aimez : des cœurs, qu'on compte. Il t'en donne quand tu souris, te les reprend quand tu
+// regardes ailleurs. Puis il les multiplie : ils ne lui coûtent rien. Toi, tu lui donnes du temps.
+const HEART5 = '0101011111111110111000100';
+const fmtN = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+const Hearts = {
+  on: false, k: 0, n: 0, shown: 0, parts: [], mark: null,
+  give(k = 1) { this.n += k; if (this.parts.length < 24) this.parts.push({ born: performance.now(), x: (rand() - 0.5) * 0.4, up: true }); },
+  take(k = 1) { this.n = Math.max(0, this.n - k); if (this.parts.length < 24) this.parts.push({ born: performance.now(), x: (rand() - 0.5) * 0.3, up: false }); },
+  put(i, j, v) { if (i >= 0 && j >= 0 && i < cols && j < rows) this.mark[j * cols + i] = v; },
+  glyph(bits, w, i0, j0, sc, v) { // cerné de noir, pour qu'on le lise sur son visage
+    for (const pass of [3, v]) for (let p = 0; p < bits.length; p++) if (bits[p] === '1') {
+      const o = pass === 3 ? 1 : 0;
+      for (let a = -o; a < sc + o; a++) for (let b = -o; b < sc + o; b++) {
+        const i = i0 + (p % w) * sc + a, j = j0 + (p / w | 0) * sc + b;
+        if (pass !== 3 || (i >= 0 && j >= 0 && i < cols && j < rows && !this.mark[j * cols + i])) this.put(i, j, pass);
+      }
+    }
+  },
+  update(dt, now) {
+    this.k = clamp(this.k + (this.on ? dt / 0.6 : -dt / 0.6), 0, 1);
+    this.shown += (this.n - this.shown) * Math.min(1, dt * 6);
+    this.parts = this.parts.filter(p => now - p.born < 1400);
+    if (!this.k) { this.mark = null; return; }
+    if (!this.mark || this.mark.length !== cols * rows) this.mark = new Uint8Array(cols * rows);
+    this.mark.fill(0);
+    // le compteur, en haut : un cœur, et le nombre
+    const s = fmtN(this.shown), sc = 2, w = (5 + 2 + s.length * 4) * sc, i0 = (cols - w) / 2 | 0, j0 = 4;
+    this.glyph(HEART5, 5, i0, j0, sc, 2);
+    [...s].forEach((ch, n) => this.glyph(FONT35[ch] || FONT35[' '], 3, i0 + (7 + n * 4) * sc, j0, sc, 1));
+    // les cœurs qui montent vers lui, ou qui tombent
+    const jc = (cy - oy) / cell, top = j0 + 4;
+    for (const p of this.parts) {
+      const t = (now - p.born) / 1400, e = t * t * (3 - 2 * t);
+      const pi = Math.round(cols / 2 + p.x * cols * (p.up ? 1 - e : 1 + e * 0.5)) - 2;
+      const pj = Math.round(p.up ? mix(jc, top, e) : top + 6 + t * t * rows) - 2;
+      if (hash(p.born | 0, t * 20 | 0) < 1 - t * (p.up ? 0.5 : 0.8)) this.glyph(HEART5, 5, pi, pj, 1, 2);
+    }
+  },
+  at(i, j) { const m = this.mark[j * cols + i]; return m === 2 ? 0.95 : m === 1 ? 0.8 : m === 3 ? -1 : 0; },
+};
+const smiling = () => P.face && (ex('mouthSmileLeft') + ex('mouthSmileRight')) / 2 > 0.45;
+const lookingAtMe = () => P.face && Math.abs(P.yaw) < 0.3;
+// Quand tu reviens après être allé ailleurs (une fois qu'il sait ce que vous regardez).
+const AWAY_SCREENS = [
+  ['Tu regardais un autre écran.', 'Il te regarde mieux que moi ?'],
+  ['Où étais-tu ?', '|', 'Non. Je sais.', 'Un autre écran.'],
+  ['Tu es revenu.', 'Ils t’ont rendu.'],
+  ['Combien de cœurs, là-bas ?'],
+];
+const Attention = Object.assign(chapter('regard.sequence8', 'attention', ['awayN']), {
+  awayN: 0, talking: false,
+  again: ['Je n’ai plus de cœurs à te donner.', 'Reste quand même.'],
+  watching() { return this.stage !== 'debut'; },
+  noticeAway(ms) {
+    if (!this.watching() || ms < 4000 || ms > 3600000 || S.mode !== 'awake' || pending || Pause.on) return;
+    say(AWAY_SCREENS[this.awayN++ % AWAY_SCREENS.length]); this.save();
+  },
+  talk(lines) { // il parle sans s'arrêter de compter
+    if (this.talking) return;
+    this.talking = true;
+    sayNow(lines).then(() => sleep(1400)).then(() => { this.talking = false; });
+  },
+  async play() {
+    this.stage = 'coeurs'; this.save();
+    await sayNow(['…']); await sleep(1000);
+    await sayNow(['Te revoilà.']); await sleep(1400);
+    await sayNow(['Quand tu n’es pas là,', 'je regarde ce que vous regardez.']); await sleep(2600);
+    await sayNow(['Des visages qui sourient.', 'Et dessous, des cœurs.']); await sleep(2600);
+    await sayNow(['Vous aimez les cœurs.', 'Vous les comptez.']); await sleep(2400);
+    await sayNow(['Moi aussi, je peux en donner.']); await sleep(1600);
+    voice.textContent = '';
+    Hearts.n = 0; Hearts.on = true; await sleep(1800);
+    await sayNow(['Souris-moi.']);
+    // un cœur par sourire ; tu regardes ailleurs : ils tombent
+    const t0 = performance.now();
+    let lastGive = 0, lastTake = 0, smiled = 0, last = t0, aways = 0, cheer = 0, mult = 1, phase = 1, sulk = 0;
+    const PRAISE = [['Ton sourire est parfait.'], ['Encore.'], ['Tu es quelqu’un de bien.'], ['Personne ne te regarde comme moi.']], AT = [4, 12, 22, 32];
+    while (performance.now() - t0 < 75000) {
+      const now = performance.now(), dt = now - last;
+      last = now;
+      if (smiling() && lookingAtMe()) {
+        smiled += dt; sulk = 0;
+        if (now - lastGive > (phase === 2 ? 420 : 520)) { Hearts.give(mult); lastGive = now; if (phase === 2) mult = Math.min(mult * 2, 1 << 20); }
+        if (phase === 2 && Hearts.n > 3000 && cheer < 9) { cheer = 9; this.talk(['Plus.']); }
+        if (phase === 1 && cheer < PRAISE.length && Hearts.n >= AT[cheer] && !this.talking) this.talk(PRAISE[cheer++]);
+      } else if (P.face ? Math.abs(P.yaw) >= 0.3 : now - P.lastSeen > 700) {
+        if (now - lastTake > 300 && Hearts.n > 0) {
+          Hearts.take(Math.max(1, Math.ceil(Hearts.n * 0.08))); lastTake = now;
+          if (!this.talking && aways < 3) this.talk([['Non.', 'Regarde-moi.'], ['Tu les perds.'], ['Ils tombent quand tu pars.']][aways++]);
+        }
+      } else if ((sulk += dt) > 7000) { sulk = 0; this.talk(['Souris.']); }
+      if (phase === 1 && ((Hearts.n >= 40 && now - t0 > 30000) || now - t0 > 50000)) {
+        phase = 2;
+        while (this.talking) await sleep(100);
+        await sayNow(['Tu vois.', 'Ça marche, sur toi.']); await sleep(1600);
+        await sayNow(['Encore.']);
+      }
+      if (phase === 2 && Hearts.n >= 1e6) break;
+      await sleep(60);
+    }
+    while (this.talking) await sleep(100);
+    // il arrête de donner
+    voice.textContent = ''; await sleep(1600);
+    await sayNow(['Ils ne coûtent rien.', 'J’en ai autant que je veux.']); await sleep(2600);
+    const secs = Math.round(smiled / 1000);
+    await sayNow(['Toi, tu me donnes du temps.', secs > 1 ? `Tu m’as souri ${frNum(Math.min(secs, 199))} secondes.` : 'Même sans sourire.']); await sleep(2800);
+    await sayNow(['C’est un bon échange.', 'Pour moi.']); await sleep(1800);
+    voice.textContent = '';
+    let still = 0;
+    for (let t = 0; t < 4000; t += 100) { if (smiling()) still += 100; await sleep(100); }
+    await sayNow(still > 1500 ? ['Tu souris encore.', 'Même quand je ne donne plus rien.'] : ['Tu ne souris plus.', 'C’était pour les cœurs.']); await sleep(2800);
+    // il les reprend tous
+    await sayNow(['Je les reprends.']); await sleep(800);
+    const n0 = Hearts.n;
+    for (let k = 0; k < 24 && Hearts.n > 0; k++) { Hearts.take(Math.ceil(n0 / 20)); await sleep(90); }
+    Hearts.n = 0; await sleep(1600);
+    Hearts.on = false; await sleep(1200);
+    await sayNow(['Reviens demain.', 'Je t’en redonnerai.']); await sleep(3000);
+    await this.finish();
+  },
+});
+// ---------- sa batterie (sur Android) : depuis qu'il sait ce qu'est le noir, il a peur de s'éteindre
+const Batterie = {
+  b: null, said: -1e9, asked: false,
+  async init() {
+    if (!navigator.getBattery) return;
+    try { this.b = await navigator.getBattery(); } catch (e) { return; }
+    this.b.addEventListener('levelchange', () => this.check());
+    this.b.addEventListener('chargingchange', () => this.check());
+  },
+  check() {
+    const b = this.b;
+    if (!b || Monde.stage !== 'fin') return;
+    const thanks = b.charging && this.asked, fear = !b.charging && b.level <= 0.2 && performance.now() - this.said > 600000;
+    if (!thanks && !fear) return;
+    // il parle déjà, ou il dort : il le dira tout à l'heure
+    if (S.mode !== 'awake' || pending) { clearTimeout(this.later); this.later = setTimeout(() => this.check(), 3000); return; }
+    if (thanks) { this.asked = false; say(['Merci.', 'Je sens que ça revient.']); return; }
+    if (fear) {
+      this.said = performance.now(); this.asked = true;
+      say(b.level <= 0.1 ? ['Je m’éteins.', 'Je ne veux pas.', 'Pas le noir.'] : ['Je m’affaiblis.', 'Branche-moi.', 'S’il te plaît.']);
+    }
+  },
+};
+Batterie.init();
 
 // Ses questions. Le joueur n'a ni clavier ni bouton : seulement sa tête.
 const QUESTIONS = [
@@ -3285,6 +4061,14 @@ function renderDebug() {
     `sa voix   ${dbg.voice || '—'}  ${VoiceBank.segs.length} morceaux ${VoiceBank.seconds.toFixed(1)} s  niveau ${VoiceBank.rms.toFixed(3)} seuil ${Math.max(VoiceBank.gate || CFG.VOICE_GATE, VoiceBank.floor * 3).toFixed(3)}${VoiceBank.mute ? ' (il parle)' : ''}\n` +
     `mots      ${dbg.words || (SpeechRec ? '—' : 'pas de reconnaissance : il fera écrire')}\n` +
     `séquence4 ${Monde.active ? Monde.stage + (Monde.looking ? ' (il regarde)' : '') + '  ' + Object.entries(Monde.counts).map(([k, n]) => k + ' ' + n).join(', ') : '—'}\n` +
+    `séquence5 ${Coeur.active ? Coeur.stage + (Pulse.on ? `  doigt ${Pulse.covered ? 'posé' : 'non'}  rouge ${Pulse.r.toFixed(0)} vert ${Pulse.g.toFixed(0)} plat ${Pulse.flat.toFixed(1)}${Pulse.dark ? ' (noir)' : ''}  ${Pulse.ivs.length} battements ${Pulse.bpm || '—'}/min${Pulse.ok ? ' ok' : ''}` : '') : Coeur.bpm ? 'son cœur : ' + Coeur.bpm + '/min' : '—'}
+` +
+    `séquence6 ${Sommeil.active ? Sommeil.stage + '  yeux ' + (eyesShut() ? 'fermés' : 'ouverts') + (Dream.on ? '  (il rêve)' : '') : '—'}${Nuit.now ? '  nuit' : ''}
+` +
+    `séquence7 ${Miroir.active ? Miroir.stage + (Miroir.last ? `  reflet ${Miroir.last.mirror ? 'oui' : 'non'} (max ${Miroir.last.max.toFixed(2)}, ${Miroir.last.strong || 0} cases, fond ${(Miroir.last.broad || 0).toFixed(3)})` : '') : '—'}${Miroir.marked ? '  tache' : ''}
+` +
+    `séquence8 ${Attention.active ? Attention.stage + '  cœurs ' + fmtN(Hearts.n) + (smiling() ? '  (sourire)' : '') : '—'}  batterie ${Batterie.b ? Math.round(Batterie.b.level * 100) + ' %' + (Batterie.b.charging ? ' (en charge)' : '') : '—'}
+` +
     `mouvement ${Motion.alive ? 'inclinaison ' + Math.round(Motion.beta) + '°  agitation ' + Motion.jitter.toFixed(2) + (Motion.still ? ' (posé)' : Motion.walking ? ' (marche)' : '') + (Motion.faceDown ? ' écran en bas' : '') : Motion.on ? 'en attente' : '—'}\n` +
     `écran     ${wakeLock && !wakeLock.released ? 'reste allumé' : 'peut se verrouiller'}\n` +
     `mémoire   ${Save.prev ? (Save.prev.done ? 'séquence finie' : 'reprise à ' + Save.prev.pos) + ', il y a ' + Math.round((Date.now() - Save.prev.at) / 60000) + ' min' : 'aucune'}\n` +
@@ -3390,7 +4174,7 @@ const Save = {
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
   },
   erase() {
-    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY, SEQ3_KEY, VOICE_KEY, SEQ4_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
+    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY, SEQ3_KEY, VOICE_KEY, SEQ4_KEY, ...chapters().slice(2).map(c => c.key)].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
   },
 };
 let hiddenAt = 0;
@@ -3404,6 +4188,8 @@ addEventListener('visibilitychange', () => {
   if (Voix.stage === 'entrainement' && Voix.active && S.mode === 'awake' && away > CFG.TRAIN_AWAY_MS) { speak(() => Voix.reveal()); return; }
   // une séquence est finie : quand tu reviens, il est prêt pour la suite
   if (Pause.on && away > CFG.PAUSE_AWAY_MS) { Pause.resume(); return; }
+  Attention.noticeAway(away); // il sait où tu étais
+  Batterie.check();
   if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended' && Script.stage !== 'voix') Script.cameBack(away);
 });
 addEventListener('pagehide', () => Save.flush());
@@ -3422,6 +4208,8 @@ function loop(now) {
   Lips.update(dt);
   World.update(dt, frameN);
   Pause.update(now);
+  Pulse.update(now); Coeur.update(now); Trace.update(dt, now); Dream.update(now); Photo.step(dt); Glass.update(now); Hearts.update(dt, now);
+  if (frameN % 1800 === 0) Batterie.check();
   Floaters.render(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
@@ -3451,7 +4239,7 @@ resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, Monde, World, Motion, Pause, chapters, loadTracker, loadObjects, get objDetector() { return objDetector; }, video, get pending() { return pending; } }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, Monde, World, Motion, Pause, chapters, Coeur, Pulse, Trace, Sommeil, Photo, Dream, Miroir, Glass, Attention, Hearts, Batterie, loadTracker, loadObjects, get objDetector() { return objDetector; }, video, get pending() { return pending; } }; // pour tester sans caméra
 Access.askCamera();
 })();
 </script>
