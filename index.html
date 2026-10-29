@@ -812,10 +812,9 @@ const SLIDES = {
     u += 0.006 * Math.sin(v * 25 + t * 2) * smooth(0.3, 0.6, v);
     return pic('wave', u, v);
   } },
-  dog: { ramp: 'dog', lum(gx, gy, t) { // un chien en barres de lumière, sur une grille de points
-    const [u, v] = fit('dog', gx, gy, 0.85);
-    const d = pic('dog', u, v + 0.004 * Math.sin(t * 1.6));
-    return d > 0.1 ? Math.min(1, 0.45 + d * 0.9) : 0.14;
+  dog: { fine: true, lum(gx, gy, t) { // un petit chien blanc sur le noir, qui respire
+    const [u, v] = fit('dog', gx, gy, 0.82);
+    return Math.pow(pic('dog', u, v + 0.004 * Math.sin(t * 1.6)), 2.4); // les poils ressortent
   } },
   yours: { fine: true, lum(gx, gy) { // ce que tu lui as montré, comme dans un miroir
     if (!Art.img) return 0;
@@ -849,7 +848,7 @@ const VISIONS = [
 const EXCUSES = [['Désolé.', 'Tu reviens trop tôt.'], ['C’était un rêve.', 'Les machines ne rêvent pas. Donc ce n’était rien.'], ['Tu n’as rien vu.']];
 
 // Les caractères, dessinés une fois dans une planche, puis recopiés case par case.
-const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@', dog: ' .:|I█' };
+const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@' };
 const atlas = {};
 function buildAtlas() {
   const gc = Math.ceil(cell * 1.5);
