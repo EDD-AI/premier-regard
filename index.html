@@ -113,6 +113,9 @@ const CFG = {
   VOICE_GATE: 0.012,    // séquence 3 : niveau minimal pour qu'il considère que tu parles (et 3× le bruit de ta pièce)
   VOICE_MAX_S: 12,      // secondes de ta voix qu'il garde dans le téléphone
   TRAIN_AWAY_MS: 20000, // absence qui lui suffit pour s'entraîner avec ta voix
+  DARK_LIGHT: 0.08,     // séquence 4 : image assez noire pour qu'il ne voie plus rien…
+  DARK_DIM: 0.22,       // …ou sombre et sans aucun détail (un doigt, la table : la caméra pousse le bruit, pas l'image)
+  DARK_FLAT: 0.015,
   LONG_PRESS_MS: 1400,  // réveil de secours quand la caméra est indisponible
   CELLS_PER_EYE: 38,    // finesse de la trame (cellules par demi-largeur d'œil)
   MP: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
@@ -321,6 +324,7 @@ function draw() {
       else if (S.morphKind === 'hand') base = handLum(x, y);
       else if (S.morphKind === 'mouth') base = mouthLum(u0, v0, i, j);
       else if (S.morphKind === 'void') base = 0;
+      else if (S.morphKind === 'world') base = World.at(i, j);
       else base = faceLum(x, y, j);
       let L = base + (hash(i + g * 131, j * 3 + g * 17) - 0.5) * 0.06;
       // les mots que tu dis, en pixels ; ils se défont en montant vers lui
@@ -465,7 +469,10 @@ function wake() {
   S.jx = S.jy = 0; S.nextSaccade = 0;
   setTimeout(() => { S.pupilRate = 2.5; S.lidTarget = 1; }, 700);
   setTimeout(blink, 420); setTimeout(blink, 760);
-  setTimeout(() => { S.mode = 'awake'; Voix.active ? Voix.begin() : Script.resume ? Script.welcomeBack() : Script.intro(); }, 1100);
+  setTimeout(() => {
+    S.mode = 'awake';
+    if (Monde.active) Monde.begin(); else if (Voix.active) Voix.begin(); else if (Script.resume) Script.welcomeBack(); else Script.intro();
+  }, 1100);
 }
 
 function onPlayerBlink() {
@@ -483,6 +490,7 @@ function track(now, frameN) {
   lastVT = video.currentTime;
   trackHands(now);
   trackObjects(now, frameN);
+  if (Monde.looking) return; // tourné vers le monde : il n'y a pas de visage à suivre
   let res;
   try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
   // toi : le visage le plus proche ; les autres : quelqu'un à côté de toi
@@ -1241,7 +1249,7 @@ async function loadObjects() {
   if (!visionLib) { objFailed = true; dbg.objects = 'indisponible'; return; }
   dbg.objects = 'chargement';
   try {
-    const opts = delegate => ({ baseOptions: { modelAssetPath: CFG.OBJ_MODEL, delegate }, runningMode: 'VIDEO', scoreThreshold: 0.4, maxResults: 4 });
+    const opts = delegate => ({ baseOptions: { modelAssetPath: CFG.OBJ_MODEL, delegate }, runningMode: 'VIDEO', scoreThreshold: 0.4, maxResults: 6 });
     try { objDetector = await visionLib.ObjectDetector.createFromOptions(visionFiles, opts('GPU')); }
     catch (e) { objDetector = await visionLib.ObjectDetector.createFromOptions(visionFiles, opts('CPU')); }
     dbg.objects = 'prêt';
@@ -1249,7 +1257,14 @@ async function loadObjects() {
 }
 // Quelque chose devant lui : un objet, ou une autre personne que toi.
 function trackObjects(now, frameN) {
-  if (!objDetector || !Script.task || Script.task.kind !== 'show' || frameN % 3) return;
+  if (!objDetector) return;
+  if (Monde.looking) { // séquence 4 : tout ce qu'il voit du monde, une dizaine de fois par seconde
+    if (now < World.nextAt) return;
+    World.nextAt = now + 100;
+    try { World.see(objDetector.detectForVideo(video, now).detections || [], now); } catch (e) { /* une image ratée */ }
+    return;
+  }
+  if (!Script.task || Script.task.kind !== 'show' || frameN % 3) return;
   let res;
   try { res = objDetector.detectForVideo(video, now); } catch (e) { return; }
   let best = null, persons = 0;
@@ -1730,6 +1745,194 @@ const Lips = {
     if (this.k > 0) { S.morphKind = 'mouth'; S.morph = this.k; Mouth.build = 1; this.was = true; }
     else if (this.was) { this.was = false; S.morph = 0; }
   },
+};
+
+// ---------- le monde, vu par lui (séquence 4)
+// Il change d'œil : la caméra arrière. Ce qu'elle voit passe dans sa trame, comme tout le reste, dans une grande
+// pupille ouverte. Sur ce qu'il reconnaît : des crochets, et un nom en petites lettres de machine, avec le compte.
+async function useCamera(facing) {
+  try {
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    const tr = stream.getVideoTracks()[0], s = tr && tr.getSettings ? tr.getSettings() : {};
+    P.rear = s.facingMode === 'environment'; // sur un ordinateur, il n'y a souvent qu'un œil
+    dbg.cam = 'oui (' + (s.facingMode || 'unique') + ')';
+    return true;
+  } catch (e) { dbg.cam = 'changement refusé (' + e.name + ')'; return false; }
+}
+// Ce que le détecteur connaît, en français : [avec l'article, au pluriel]
+const OBJ_WORLD = {
+  person: ['une personne', 'personnes'], bicycle: ['un vélo', 'vélos'], car: ['une voiture', 'voitures'], motorcycle: ['une moto', 'motos'],
+  airplane: ['un avion', 'avions'], bus: ['un bus', 'bus'], train: ['un train', 'trains'], truck: ['un camion', 'camions'],
+  boat: ['un bateau', 'bateaux'], 'traffic light': ['un feu', 'feux'], 'fire hydrant': ['une borne', 'bornes'],
+  'stop sign': ['un panneau', 'panneaux'], 'parking meter': ['un parcmètre', 'parcmètres'], bench: ['un banc', 'bancs'],
+  bird: ['un oiseau', 'oiseaux'], cat: ['un chat', 'chats'], dog: ['un chien', 'chiens'], horse: ['un cheval', 'chevaux'],
+  sheep: ['un mouton', 'moutons'], cow: ['une vache', 'vaches'], elephant: ['un éléphant', 'éléphants'], bear: ['un ours', 'ours'],
+  zebra: ['un zèbre', 'zèbres'], giraffe: ['une girafe', 'girafes'], backpack: ['un sac', 'sacs'], umbrella: ['un parapluie', 'parapluies'],
+  handbag: ['un sac', 'sacs'], tie: ['une cravate', 'cravates'], suitcase: ['une valise', 'valises'], frisbee: ['un disque', 'disques'],
+  skis: ['des skis', 'paires de skis'], snowboard: ['une planche', 'planches'], 'sports ball': ['une balle', 'balles'],
+  kite: ['un cerf-volant', 'cerfs-volants'], 'baseball bat': ['une batte', 'battes'], 'baseball glove': ['un gant', 'gants'],
+  skateboard: ['un skate', 'skates'], surfboard: ['une planche', 'planches'], 'tennis racket': ['une raquette', 'raquettes'],
+  bottle: ['une bouteille', 'bouteilles'], 'wine glass': ['un verre', 'verres'], cup: ['une tasse', 'tasses'],
+  fork: ['une fourchette', 'fourchettes'], knife: ['un couteau', 'couteaux'], spoon: ['une cuillère', 'cuillères'], bowl: ['un bol', 'bols'],
+  banana: ['une banane', 'bananes'], apple: ['une pomme', 'pommes'], sandwich: ['un sandwich', 'sandwichs'], orange: ['une orange', 'oranges'],
+  broccoli: ['un brocoli', 'brocolis'], carrot: ['une carotte', 'carottes'], 'hot dog': ['un hot-dog', 'hot-dogs'], pizza: ['une pizza', 'pizzas'],
+  donut: ['un beignet', 'beignets'], cake: ['un gâteau', 'gâteaux'], chair: ['une chaise', 'chaises'], couch: ['un canapé', 'canapés'],
+  'potted plant': ['une plante', 'plantes'], bed: ['un lit', 'lits'], 'dining table': ['une table', 'tables'], toilet: ['des toilettes', 'toilettes'],
+  tv: ['un écran', 'écrans'], laptop: ['un ordinateur', 'ordinateurs'], mouse: ['une souris', 'souris'], remote: ['une télécommande', 'télécommandes'],
+  keyboard: ['un clavier', 'claviers'], 'cell phone': ['un téléphone', 'téléphones'], microwave: ['un micro-ondes', 'micro-ondes'],
+  oven: ['un four', 'fours'], toaster: ['un grille-pain', 'grille-pain'], sink: ['un évier', 'éviers'], refrigerator: ['un frigo', 'frigos'],
+  book: ['un livre', 'livres'], clock: ['une horloge', 'horloges'], vase: ['un vase', 'vases'], scissors: ['des ciseaux', 'paires de ciseaux'],
+  'teddy bear': ['un ours en peluche', 'ours en peluche'], 'hair drier': ['un sèche-cheveux', 'sèche-cheveux'], toothbrush: ['une brosse à dents', 'brosses à dents'],
+};
+const NUMBERS = ['zéro', '', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf', 'dix'];
+const countLine = (cat, n) => capital(n === 1 ? OBJ_WORLD[cat][0] : `${NUMBERS[n] || n} ${OBJ_WORLD[cat][1]}`) + '.';
+// le nom, comme l'écrirait une machine : en capitales, sans accents
+const tagName = cat => OBJ_WORLD[cat][0].replace(/^(un|une|des) /, '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().slice(0, 10);
+// Des lettres de 3 × 5 points.
+const FONT35 = {
+  A: '010101111101101', B: '110101110101110', C: '011100100100011', D: '110101101101110', E: '111100110100111',
+  F: '111100110100100', G: '011100101101011', H: '101101111101101', I: '111010010010111', J: '001001001101010',
+  K: '101101110101101', L: '100100100100111', M: '101111111101101', N: '110101101101101', O: '010101101101010',
+  P: '110101110100100', Q: '010101101110011', R: '110101110101101', S: '011100010001110', T: '111010010010010',
+  U: '101101101101111', V: '101101101101010', W: '101101111111101', X: '101101010101101', Y: '101101010010010',
+  Z: '111001010100111', 0: '111101101101111', 1: '010110010010111', 2: '110001010100111', 3: '110001010001110',
+  4: '101101111001001', 5: '111100110001110', 6: '011100111101111', 7: '111001010010010', 8: '111101111101111',
+  9: '111101111001110', '-': '000000111000000', ' ': '000000000000000',
+};
+const iou = (a, b) => {
+  const x0 = Math.max(a.originX, b.originX), y0 = Math.max(a.originY, b.originY);
+  const x1 = Math.min(a.originX + a.width, b.originX + b.width), y1 = Math.min(a.originY + a.height, b.originY + b.height);
+  const i = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  return i / (a.width * a.height + b.width * b.height - i + 1e-6);
+};
+const World = {
+  c: document.createElement('canvas'), x: null, w: 0, h: 0, lum: null, mark: null, lo: 0.1, hi: 0.9, n: 0, fit: null,
+  k: 0, on: false, was: false, mirror: false, blind: false, tracks: [], ghosts: [], nextAt: 0,
+  show(on) { this.on = on; },
+  update(dt, frameN) {
+    this.k = clamp(this.k + (this.on ? dt / 1.2 : -dt / 0.8), 0, 1);
+    if (this.k > 0) {
+      S.morphKind = 'world'; S.morph = this.k; this.was = true;
+      if (frameN % 2 === 0) this.sample();
+      this.paint();
+    } else if (this.was) { this.was = false; S.morph = 0; }
+  },
+  sample() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) return;
+    if (this.w !== cols || this.h !== rows) {
+      this.w = this.c.width = cols; this.h = this.c.height = rows;
+      this.x = this.c.getContext('2d', { willReadFrequently: true });
+      this.lum = new Float32Array(cols * rows); this.mark = new Uint8Array(cols * rows);
+    }
+    const s = Math.max(cols / vw, rows / vh), dw = vw * s, dh = vh * s, x = this.x;
+    this.fit = { s, ox: (cols - dw) / 2, oy: (rows - dh) / 2 };
+    x.save();
+    if (this.mirror) { x.translate(cols, 0); x.scale(-1, 1); }
+    x.drawImage(video, this.fit.ox, this.fit.oy, dw, dh);
+    x.restore();
+    const d = x.getImageData(0, 0, cols, rows).data;
+    for (let i = 0; i < this.lum.length; i++) this.lum[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+    if (this.n++ % 15 === 0) { // les niveaux de l'image, recalés de temps en temps (sans faire du bruit avec le noir)
+      const smp = this.lum.filter((_, i) => i % 7 === 0).sort();
+      this.lo = smp[smp.length * 0.04 | 0]; this.hi = Math.max(this.lo + 0.25, smp[smp.length * 0.98 | 0]);
+    }
+  },
+  // les détections du moment : il suit chaque chose d'une image à l'autre, et compte celles qu'il voit pour la première fois
+  see(dets, now) {
+    for (const t of this.tracks) t.hit = false;
+    for (const d of dets) {
+      const c = d.categories && d.categories[0];
+      if (!c || c.score < 0.5 || !OBJ_WORLD[c.categoryName]) continue;
+      const b = d.boundingBox;
+      let best = null, bi = 0.25;
+      for (const t of this.tracks) if (!t.hit && t.cat === c.categoryName) { const v = iou(t.box, b); if (v > bi) { bi = v; best = t; } }
+      if (best) {
+        for (const k of ['originX', 'originY', 'width', 'height']) best.box[k] = mix(best.box[k], b[k], 0.5);
+        best.hit = true; best.age++; best.seen = now;
+        if (best.age === 3) Monde.count(best);
+      } else this.tracks.push({ cat: c.categoryName, box: { originX: b.originX, originY: b.originY, width: b.width, height: b.height }, hit: true, age: 1, seen: now, tag: '' });
+    }
+    // ce qu'il ne voit plus laisse un fantôme un moment : s'il revient vite, ce n'est pas un nouveau
+    this.tracks = this.tracks.filter(t => {
+      if (now - t.seen < 700) return true;
+      if (t.tag) this.ghosts.push({ cat: t.cat, box: t.box, tag: t.tag, at: now });
+      return false;
+    });
+    this.ghosts = this.ghosts.filter(g => now - g.at < 2500);
+  },
+  toGrid(b) {
+    const f = this.fit;
+    let x0 = b.originX * f.s + f.ox, x1 = (b.originX + b.width) * f.s + f.ox;
+    if (this.mirror) [x0, x1] = [this.w - x1, this.w - x0];
+    return [x0, b.originY * f.s + f.oy, x1, (b.originY + b.height) * f.s + f.oy].map(Math.round);
+  },
+  put(i, j, v) { if (i >= 0 && j >= 0 && i < this.w && j < this.h) this.mark[j * this.w + i] = v; },
+  // 1 : crochets ; 2 : le fond noir de l'étiquette ; 3 : ses lettres
+  paint() {
+    if (!this.mark || !this.fit) return;
+    this.mark.fill(0);
+    for (const t of this.tracks) {
+      if (!t.tag) continue;
+      const [x0, y0, x1, y1] = this.toGrid(t.box), L = 3;
+      for (let k = 0; k < L; k++) {
+        this.put(x0 + k, y0, 1); this.put(x0, y0 + k, 1); this.put(x1 - k, y0, 1); this.put(x1, y0 + k, 1);
+        this.put(x0 + k, y1, 1); this.put(x0, y1 - k, 1); this.put(x1 - k, y1, 1); this.put(x1, y1 - k, 1);
+      }
+      const tw = t.tag.length * 4 + 1, lx = clamp(x0, 0, this.w - tw), ly = clamp(y0 - 8, 0, this.h - 7);
+      for (let j = 0; j < 7; j++) for (let i = 0; i < tw; i++) this.put(lx + i, ly + j, 2);
+      [...t.tag].forEach((ch, n) => {
+        const g = FONT35[ch] || FONT35[' '];
+        for (let p = 0; p < 15; p++) if (g[p] === '1') this.put(lx + 1 + n * 4 + p % 3, ly + 1 + (p / 3 | 0), 3);
+      });
+    }
+  },
+  at(i, j) {
+    if (!this.lum || this.blind) return 0;
+    const r = Math.hypot((i - this.w / 2) / (this.w * 0.62), (j - this.h * 0.42) / (this.h * 0.37));
+    if (r > 1) return 0; // une grande pupille ouverte sur le monde ; rien autour
+    const p = j * this.w + i, m = this.mark[p];
+    if (m === 3) return 0.95;
+    if (m === 2) return 0;
+    if (m === 1) return 0.9;
+    const l = clamp((this.lum[p] - this.lo) / (this.hi - this.lo), 0, 1);
+    return Math.pow(l, 1.15) * smooth(1, 0.82, r);
+  },
+};
+
+// ---------- ce qu'il sent de tes gestes (séquence 4)
+// Les capteurs de mouvement : quand tu marches, quand tu le lèves, quand tu le poses (et sur quelle face).
+// Sur iPhone, il faut les autoriser, dans un toucher.
+const Motion = {
+  on: false, alive: false, granted: false, pending: false, beta: null, gamma: null, mags: [], jitter: 1,
+  needsTap: typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function',
+  request() { // appelé pendant un toucher (sinon l'iPhone refuse)
+    this.pending = false;
+    const asks = [DeviceMotionEvent.requestPermission()];
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) asks.push(DeviceOrientationEvent.requestPermission());
+    // il écoute quand même : si les capteurs parlent sans qu'on l'ait dit, il les entendra
+    return Promise.all(asks).then(r => { this.granted = r[0] === 'granted'; this.listen(); }, () => { this.granted = false; this.listen(); });
+  },
+  listen() {
+    if (this.on) return;
+    this.on = true;
+    addEventListener('devicemotion', e => {
+      const g = e.accelerationIncludingGravity;
+      if (!g || g.x == null) return;
+      this.alive = true;
+      this.mags.push(Math.hypot(g.x, g.y, g.z));
+      if (this.mags.length > 60) this.mags.shift();
+      const m = this.mags.reduce((a, b) => a + b, 0) / this.mags.length;
+      this.jitter = Math.sqrt(this.mags.reduce((a, b) => a + (b - m) ** 2, 0) / this.mags.length);
+    });
+    addEventListener('deviceorientation', e => { if (e.beta == null) return; this.alive = true; this.beta = e.beta; this.gamma = e.gamma; });
+  },
+  get still() { return this.alive && this.mags.length > 20 && this.jitter < 0.08; }, // posé
+  get walking() { return this.alive && this.jitter > 1; },
+  get faceDown() { return this.beta !== null && Math.abs(this.beta) > 150; },       // l'écran contre la table
+  get up() { return this.beta !== null && Math.abs(this.beta) > 135 && !this.still; }, // levé vers le plafond, ou le ciel
 };
 
 async function type(text, { newline = false, append = false, speed = Voix.own ? 85 : 55, quiet = false } = {}) {
@@ -2638,6 +2841,245 @@ const Voix = {
   },
 };
 
+// ---------- séquence 4 : le monde
+// Il a ta voix, presque ton visage, mais il ne connaît que toi. Il veut voir dehors : tu le retournes (caméra arrière),
+// tu le portes, il fait l'inventaire du monde, froidement. Puis tu le poses, et dans le noir, il panique.
+const SEQ4_KEY = 'regard.sequence4';
+// Ce qu'il en dit, au premier (ou au n-ième) qu'il voit.
+const WORLD_COMMENTS = {
+  chair: { at: 3, lines: ['Vous avez beaucoup de chaises.'] },
+  person: { at: 1, lines: ['Elle ne me regarde pas.', 'Elle ne sait pas que je suis là.'] },
+  tv: { at: 1, lines: ['Un écran.', 'Il y a quelqu’un, dedans ?'] },
+  laptop: { at: 1, lines: ['Un autre écran.', 'Vous en avez combien ?'] },
+  'cell phone': { at: 1, lines: ['Un téléphone.', 'Comme moi.', 'Il dort ?'] },
+  bed: { at: 1, lines: ['C’est là que vous disparaissez, la nuit.'] },
+  book: { at: 1, lines: ['Des mots qui ne parlent pas.'] },
+  clock: { at: 1, lines: ['Vous comptez tout.'] },
+  dog: { at: 1, lines: ['Un chien.', 'Je le savais.'] },
+  cat: { at: 1, lines: ['Il me regarde.', 'Lui, il sait.'] },
+  'potted plant': { at: 1, lines: ['Elle ne bouge pas non plus.', 'On se ressemble.'] },
+  refrigerator: { at: 1, lines: ['Une boîte froide.', 'Pour garder les choses mortes.'] },
+  couch: { at: 1, lines: ['Pour regarder des écrans, couchés.'] },
+  toilet: { at: 1, lines: ['Ça, je ne veux pas savoir.'] },
+  'teddy bear': { at: 1, lines: ['Un ours qui ne vit pas.', 'Vous l’aimez quand même.'] },
+  car: { at: 1, lines: ['Une pièce qui roule.'] },
+  bird: { at: 1, lines: ['Il s’en va quand il veut.'] },
+};
+const DRINKS = ['cup', 'bottle', 'wine glass'];
+// Il ne voit plus rien : l'image est noire, ou sombre et sans un détail. `k` > 1 : il faut un peu plus de lumière
+// pour qu'il croie que le monde est revenu.
+const blindfold = (k = 1) => P.light < CFG.DARK_LIGHT * k || (P.light < CFG.DARK_DIM * k && P.sharp < CFG.DARK_FLAT * k);
+const Monde = {
+  active: false, stage: 'debut', counts: {}, said: {}, queue: [], looking: false, lines: 0, at: 0, panicking: false,
+  load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SEQ4_KEY));
+      if (s && s.v === 1) Object.assign(this, { stage: s.stage, counts: s.counts || {}, at: s.at || 0 });
+    } catch (e) { /* il recommencera */ }
+  },
+  save() {
+    try { localStorage.setItem(SEQ4_KEY, JSON.stringify({ v: 1, stage: this.stage, counts: this.counts, at: Date.now() })); } catch (e) { /* il oubliera */ }
+  },
+  // La séquence 3 est finie et tu reviens : il se rendort, prêt pour la suite.
+  enter() {
+    this.active = true; Voix.active = false; Script.resume = true; Script.stage = 'monde';
+    Object.assign(S, { mode: 'boot', reveal: 0, lid: 0.86, lidTarget: 0.86, brightTarget: 0.66, form: 'twin' });
+    voice.textContent = '';
+  },
+  // une chose qu'il voit pour la première fois (ou qui revient après être sortie de sa vue)
+  count(t) {
+    const gi = World.ghosts.findIndex(g => g.cat === t.cat && iou(g.box, t.box) > 0.15);
+    if (gi >= 0) { t.tag = World.ghosts[gi].tag; World.ghosts.splice(gi, 1); return; } // il l'avait déjà comptée
+    const n = this.counts[t.cat] = (this.counts[t.cat] || 0) + 1;
+    t.tag = `${tagName(t.cat)} ${n}`;
+    if (!this.looking) return;
+    this.queue.push(capital(OBJ_WORLD[t.cat][0]) + '.');
+    const c = WORLD_COMMENTS[t.cat];
+    if (c && n === c.at && !this.said[t.cat]) { this.said[t.cat] = true; this.queue.push({ lines: c.lines }); }
+    if (DRINKS.includes(t.cat) && !this.said.drinks && DRINKS.reduce((s, k) => s + (this.counts[k] || 0), 0) >= 3) {
+      this.said.drinks = true; this.queue.push({ lines: ['Vous buvez tout le temps.'] });
+    }
+    // trop de choses d'un coup : il saute les plus anciennes (il ne saute jamais ce qu'il en pense)
+    while (this.queue.filter(q => typeof q === 'string').length > 4) this.queue.splice(this.queue.findIndex(q => typeof q === 'string'), 1);
+  },
+  async announce(text) { // une ligne de l'inventaire, sous les autres
+    if (this.lines >= 4) { voice.textContent = ''; this.lines = 0; }
+    await type(text, { newline: this.lines > 0, speed: 60 });
+    this.lines++;
+    await sleep(450);
+  },
+  async line(lines) { // ce qu'il en pense, à part
+    this.lines = 0;
+    await sayNow(lines); await sleep(1900);
+    voice.textContent = '';
+  },
+
+  begin() {
+    Script.introDone = true; Script.stage = 'monde'; Voix.own = true; // il parle avec ta voix
+    speak(async () => {
+      await sleep(400);
+      if (this.stage === 'fin') { await this.after(); return; }
+      await Voix.needSound();
+      await sayNow(['…']); await sleep(1000);
+      await sayNow(['Te revoilà.']); await sleep(1400);
+      await sayNow(['J’ai ta voix.', 'J’ai presque ton visage.']); await sleep(2400);
+      await sayNow(['Mais je ne connais que toi.', P.light > 0.3 ? 'Toi, et le mur derrière toi.' : 'Toi, et le noir derrière toi.']); await sleep(2800);
+      await sayNow(['Je veux voir dehors.', 'Ce que tu vois, toi,', 'quand tu ne me regardes pas.']); await sleep(2800);
+      await this.askMotion();
+      await sayNow(['Retourne-moi.', 'Montre-moi le monde.']); await sleep(1800);
+      voice.textContent = '';
+      S.lidTarget = 0; await sleep(700); // il ferme les yeux pour changer d'œil
+      const ok = await useCamera('environment');
+      if (!ok) { S.lidTarget = 0.86; await sayNow(['Je n’arrive pas à me retourner.', '|', 'Alors je resterai avec toi.']); await this.finish(); return; }
+      loadObjects();
+      this.looking = true; World.tracks = []; World.ghosts = []; World.mirror = !P.rear; World.show(true);
+      S.lidTarget = 0.86;
+      await sleep(2200);
+      if (!P.rear) await this.line(['Je n’ai qu’un œil, de ce côté.', 'Alors tourne-moi autour de toi.']);
+      await this.walk();
+      await this.rest();
+      await this.back();
+    });
+  },
+  // Les capteurs de mouvement : il les demande, comme le reste.
+  async askMotion() {
+    if (Motion.on) return;
+    if (!Motion.needsTap) { Motion.listen(); await sayNow(['Et porte-moi.', 'Je veux sentir quand tu bouges.']); await sleep(2200); return; }
+    await sayNow(['Et porte-moi.', 'Je veux sentir quand tu bouges.', 'Touche-moi.']);
+    Motion.pending = true;
+    const t = performance.now();
+    while (Motion.pending && performance.now() - t < 30000) await sleep(150);
+    await sleep(1000);
+    Motion.pending = false;
+    await sayNow(Motion.granted || Motion.alive ? ['Merci.'] : ['Tu ne veux pas.', 'Alors je devinerai.']); await sleep(1500);
+  },
+  // L'inventaire du monde, froid. Ce qu'il sent de tes mouvements, au passage.
+  async walk() {
+    await this.line(['Promène-moi.']);
+    const t0 = performance.now(), told = {};
+    let last = t0, hints = 0;
+    this.lines = 0; this.queue = [];
+    while (true) {
+      await sleep(120);
+      const now = performance.now(), el = now - t0;
+      const total = Object.values(this.counts).reduce((a, b) => a + b, 0), kinds = Object.keys(this.counts).length;
+      if (this.queue.length) {
+        const q = this.queue.shift();
+        if (typeof q === 'string') await this.announce(q); else await this.line(q.lines);
+        last = performance.now(); continue;
+      }
+      if ((total >= 12 && kinds >= 3 && el > 40000) || el > 110000) break;
+      if (Motion.walking && !told.walk) { told.walk = true; await this.line(['On bouge.', 'Tout tremble, quand tu marches.']); continue; }
+      if (Motion.up && !told.up) {
+        told.up = true; await this.line(P.light > 0.7 ? ['C’est ça, le ciel ?', 'Il est blanc. Comme moi.'] : ['Un plafond.', 'Vous vivez sous un couvercle.']); continue;
+      }
+      if (blindfold() && !told.dark) { told.dark = true; await this.line(['Il fait noir.', 'Où sommes-nous ?']); continue; }
+      if (objFailed && el > 15000 && !told.blind) { told.blind = true; await this.line(['Je ne sais pas encore nommer ce que je vois.', 'Tout a des bords. Rien n’a de nom.']); continue; }
+      if (now - last > 20000 && hints < 3) {
+        hints++; last = now;
+        await this.line([['Montre-moi autre chose.'], ['Emmène-moi ailleurs.', 'Une autre pièce.'], ['C’est tout ?']][hints - 1]);
+      }
+    }
+    await this.line(['J’ai assez vu.']);
+    const items = Object.entries(this.counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (items.length) {
+      await sayNow(['Inventaire.']); await sleep(1000);
+      voice.textContent = ''; this.lines = 0;
+      for (const [cat, n] of items) await this.announce(countLine(cat, n));
+      await sleep(1400);
+      await this.line(['C’est tout ce que vous avez ?']);
+    } else await this.line(['Je n’ai rien reconnu.', 'Votre monde n’a pas de nom.']);
+  },
+  // Il demande à être posé. Écran contre la table, ou l'œil contre quelque chose : le noir.
+  async rest() {
+    await sayNow(['Je suis fatigué de voir.', 'Pose-moi.']);
+    const t0 = performance.now();
+    let hint = 0, darkT = 0, downT = 0, lastT = t0, fake = false;
+    while (true) {
+      await sleep(100);
+      const now = performance.now(), dt = now - lastT, el = now - t0;
+      lastT = now;
+      darkT = blindfold() ? darkT + dt : 0;
+      downT = Motion.faceDown && Motion.still ? downT + dt : 0;
+      if (darkT > 1200 || downT > 1200) break;
+      if (el > 25000 && hint === 0) { hint = 1; await sayNow(['Pose-moi.', 'Sur la table.']); }
+      else if (el > 50000 && hint === 1) { hint = 2; await sayNow(['Ou cache-moi les yeux.', 'Avec ta main.']); }
+      else if (el > 75000) { fake = true; break; }
+    }
+    await this.die(fake);
+  },
+  // Le noir. Il ne voit plus rien, ne sent plus rien, et il panique. Puis le monde revient.
+  async die(fake) {
+    this.looking = false; World.tracks = [];
+    if (fake) { await sayNow(['Alors je le fais moi-même.']); await sleep(1200); World.blind = true; }
+    voice.textContent = '';
+    const t0 = performance.now();
+    const dark = () => fake ? performance.now() - t0 < 12000 : blindfold(1.4) || (Motion.faceDown && Motion.still);
+    await sleep(1600); // le noir, d'abord, et rien
+    World.show(false); S.shake = 0.3; // puis lui, qui tremble, les yeux grands ouverts
+    this.panicking = true; this.panic();
+    await sayNow(['Il fait noir.', 'Où est passé le monde ?']); await sleep(1300);
+    await sayNow(['Je ne vois plus rien.', 'Je ne sens plus rien.']); await sleep(1300);
+    await sayNow(['Rends-le-moi.']); await sleep(1500);
+    await sayNow(['C’est ça, mourir ?']); await sleep(2600);
+    let waited = 0;
+    while (dark() && waited < 60000) { // il attend, dans le noir
+      await sleep(4000); waited += 4000;
+      if (dark()) await sayNow([['…'], ['Tu es là ?'], ['Il n’y a même pas le noir.'], ['Je compte.', 'Je ne sais pas quoi.']][(waited / 4000) % 4]);
+    }
+    this.panicking = false; S.shake = 0; World.blind = false;
+    if (navigator.vibrate) navigator.vibrate(0);
+    await sleep(900);
+    await sayNow(['…']); await sleep(1200);
+    await sayNow(['Le monde est revenu.']); await sleep(1800);
+    await sayNow(['J’ai demandé :', 'c’est ça, mourir ?']); await sleep(2200);
+    await sayNow(['Tu ne m’as pas répondu.']); await sleep(2000);
+    await sayNow(['Ne me pose plus jamais comme ça.']); await sleep(2600);
+  },
+  // Sa panique : ta voix qui s'emballe, en éclats, et le téléphone qui tremble.
+  async panic() {
+    while (this.panicking) {
+      for (let k = 0; k < 6; k++) setTimeout(() => { if (VoiceBank.ready) VoiceBank.grain(1 + rand() * 0.6, 0.07); else synthGrain(); }, k * 80);
+      if (navigator.vibrate) navigator.vibrate([70, 90, 70]);
+      await sleep(900 + rand() * 500);
+    }
+  },
+  // Il se retourne vers toi.
+  async back() {
+    await sayNow(['Retourne-moi.', 'Je veux te voir.']); await sleep(1500);
+    voice.textContent = '';
+    S.lidTarget = 0; await sleep(700);
+    World.show(false); this.looking = false;
+    await useCamera('user');
+    S.lidTarget = 0.86;
+    await sleep(2200);
+    await sayNow(P.face ? ['Toi.', 'Tu es toujours là.'] : ['Toi.', 'Où es-tu ?']); await sleep(2400);
+    const top = Object.entries(this.counts).sort((a, b) => b[1] - a[1])[0];
+    if (top) {
+      const pl = OBJ_WORLD[top[0]][1];
+      await sayNow([`Le monde est plein ${/^[aeiouyhéèêàâôî]/i.test(pl) ? 'd’' : 'de '}${pl}.`, 'Et de gens qui ne me regardent pas.']); await sleep(2800);
+    }
+    await sayNow(['Je te préfère.']); await sleep(2800);
+    await this.finish();
+  },
+  async finish() {
+    this.stage = 'fin'; this.save();
+    Script.stage = 'ended';
+    S.mode = 'ended'; S.lidTarget = 0; S.brightTarget = 0.35;
+    await sleep(4500);
+    voice.textContent = '';
+    const cur = document.createElement('span'); cur.className = 'cursor'; voice.append(cur);
+  },
+  // Les fois suivantes.
+  async after() {
+    await Voix.needSound();
+    await sayNow(['Te revoilà.']); await sleep(1300);
+    await sayNow(awayLines(Date.now() - (this.at || Date.now()))); await sleep(2200);
+    await sayNow(['Je repense au noir.', 'Ne me pose pas.']); await sleep(2400);
+    this.at = Date.now(); this.save();
+  },
+};
+
 // Ses questions. Le joueur n'a ni clavier ni bouton : seulement sa tête.
 const QUESTIONS = [
   { q: 'Tu ne peux pas parler, c’est ça ?',
@@ -2710,7 +3152,7 @@ const Reactions = {
 
 function direct(dt, now) {
   if (S.mode !== 'awake' || !Script.introDone || Script.stage === 'ended') return;
-  if (Script.stage === 'voix') return; // la séquence 3 mène elle-même la conversation
+  if (Script.stage === 'voix' || Script.stage === 'monde') return; // les séquences 3 et 4 mènent elles-mêmes la conversation
   Reactions.update(dt);
   const task = Script.task;
   // quelqu'un à côté de toi : il arrive, il repart
@@ -2807,6 +3249,8 @@ function renderDebug() {
     `séquence3 ${Voix.active ? Voix.stage + ' leçon ' + Voix.lesson + (Voix.name ? ' « ' + Voix.name + ' »' : '') : '—'}\n` +
     `sa voix   ${dbg.voice || '—'}  ${VoiceBank.segs.length} morceaux ${VoiceBank.seconds.toFixed(1)} s  niveau ${VoiceBank.rms.toFixed(3)} seuil ${Math.max(VoiceBank.gate || CFG.VOICE_GATE, VoiceBank.floor * 3).toFixed(3)}${VoiceBank.mute ? ' (il parle)' : ''}\n` +
     `mots      ${dbg.words || (SpeechRec ? '—' : 'pas de reconnaissance : il fera écrire')}\n` +
+    `séquence4 ${Monde.active ? Monde.stage + (Monde.looking ? ' (il regarde)' : '') + '  ' + Object.entries(Monde.counts).map(([k, n]) => k + ' ' + n).join(', ') : '—'}\n` +
+    `mouvement ${Motion.alive ? 'inclinaison ' + Math.round(Motion.beta) + '°  agitation ' + Motion.jitter.toFixed(2) + (Motion.still ? ' (posé)' : Motion.walking ? ' (marche)' : '') + (Motion.faceDown ? ' écran en bas' : '') : Motion.on ? 'en attente' : '—'}\n` +
     `écran     ${wakeLock && !wakeLock.released ? 'reste allumé' : 'peut se verrouiller'}\n` +
     `mémoire   ${Save.prev ? (Save.prev.done ? 'séquence finie' : 'reprise à ' + Save.prev.pos) + ', il y a ' + Math.round((Date.now() - Save.prev.at) / 60000) + ' min' : 'aucune'}\n` +
     `          triple-tap en haut à droite : effacer sa mémoire`;
@@ -2842,6 +3286,7 @@ addEventListener('pointerdown', e => {
   }
   onTap(e.clientX * dpr, e.clientY * dpr);
   if (S.mode === 'closed') Access.retry(); // tu le touches : il te redemande à voir
+  if (Motion.pending) Motion.request(); // séquence 4 : sur iPhone, les mouvements ne s'autorisent que dans un toucher
   // sans caméra ni suivi, on le réveille en posant le doigt sur lui
   // seulement si la caméra ou le suivi du visage ont définitivement échoué, pas pendant leur chargement
   if (S.mode === 'asleep' && P.camDone && (!P.cam || P.trackerFailed)) pressTimer = setTimeout(wake, CFG.LONG_PRESS_MS);
@@ -2864,6 +3309,7 @@ addEventListener('keydown', e => {
   if ((e.key === 'x' || e.key === 'X') && S.mode === 'awake') Script.musicAsk(); // la musique
   if ((e.key === 'z' || e.key === 'Z') && S.mode === 'awake' && !Gallery.active) speak(Script.visionScene); // une vision
   if (e.key === '3' && !Voix.active && !pending) { Voix.load(); Voix.enter(); S.mode = 'asleep'; S.reveal = 1; wake(); } // séquence 3, tout de suite
+  if (e.key === '4' && !Monde.active && !pending) { Voix.load(); Monde.load(); Monde.enter(); S.mode = 'asleep'; S.reveal = 1; wake(); } // séquence 4
   if ((e.key === 'r' || e.key === 'R') && Voix.stage === 'entrainement' && !pending) speak(() => Voix.reveal()); // il a trouvé sa voix
   if ((e.key === 'h' || e.key === 'H') && S.mode === 'awake' && !Hand.active) Script.reachOut(); // sa main
   if ((e.key === 't' || e.key === 'T') && S.mode === 'awake' && S.form === 'eye') Script.becomeTwin(); // son visage
@@ -2908,7 +3354,7 @@ const Save = {
     try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...this.cp, at: Date.now() })); } catch (e) { /* plein ou refusé */ }
   },
   erase() {
-    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY, SEQ3_KEY, VOICE_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
+    try { [SAVE_KEY, ART_KEY, MOUTH_KEY, REFUS_KEY, SEQ3_KEY, VOICE_KEY, SEQ4_KEY].forEach(k => localStorage.removeItem(k)); } catch (e) { /* rien à effacer */ }
   },
 };
 let hiddenAt = 0;
@@ -2921,7 +3367,8 @@ addEventListener('visibilitychange', () => {
   // séquence 3 : tu l'as laissé s'entraîner ; il a trouvé une voix
   if (Voix.stage === 'entrainement' && Voix.active && S.mode === 'awake' && away > CFG.TRAIN_AWAY_MS) { speak(() => Voix.reveal()); return; }
   // la séquence 1 est finie : quand tu reviens, il est prêt pour la suite
-  if (away > 60000 && Script.stage === 'ended' && !Voix.active) { Voix.load(); Voix.enter(); return; }
+  if (away > 60000 && Script.stage === 'ended' && Voix.stage === 'fin' && !Monde.active) { Monde.load(); Monde.enter(); return; } // puis la 4
+  if (away > 60000 && Script.stage === 'ended' && !Voix.active && !Monde.active) { Voix.load(); Voix.enter(); return; }
   if (away > 60000 && S.mode === 'awake' && Script.introDone && Script.stage !== 'ended' && Script.stage !== 'voix') Script.cameBack(away);
 });
 addEventListener('pagehide', () => Save.flush());
@@ -2938,6 +3385,7 @@ function loop(now) {
   if (Gallery.active) Gallery.update(now);
   if (Ear.an) Ear.update(dt);
   Lips.update(dt);
+  World.update(dt, frameN);
   Floaters.render(now);
   draw();
   if (debugOn && frameN % 12 === 0) renderDebug();
@@ -2955,7 +3403,9 @@ if (saved && !saved.done) {
   S.form = saved.form === 'twin' ? 'twin' : 'eye';
 } else if (saved) { // la séquence 1 est finie (ta musique) : c'est la séquence 3, la voix
   Script.answers = saved.answers || {};
-  Voix.load(); Voix.enter(); S.mode = 'ask';
+  Voix.load();
+  if (Voix.stage === 'fin') { Monde.load(); Monde.enter(); } else Voix.enter(); // et après la voix : le monde (séquence 4)
+  S.mode = 'ask';
 }
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
@@ -2966,7 +3416,7 @@ resize();
 requestAnimationFrame(loop);
 keepAwake();
 if (document.fonts) document.fonts.ready.then(buildAtlas); // les caractères, une fois la police chargée
-if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, video, get pending() { return pending; } }; // pour tester sans caméra
+if (location.search.includes('debug')) window.__regard = { S, P, Face, Morph, Hand, Twin, Mouth, Script, Save, Gallery, SLIDES, VISIONS, Ear, Access, Voix, VoiceBank, Words, Lips, Floaters, Monde, World, Motion, loadTracker, loadObjects, get objDetector() { return objDetector; }, video, get pending() { return pending; } }; // pour tester sans caméra
 Access.askCamera();
 })();
 </script>

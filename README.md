@@ -26,10 +26,20 @@ Elle s’ouvre quand la séquence 1 est finie (après la musique), la fois suiva
 - Quand tu reviens : sa bouche, finie, bouge enfin, et il te parle avec ta voix, découpée et ralentie (« J’ai trouvé une voix. Tu ne t’en servais pas tout le temps. »). Il rejoue ton prénom, dit par toi, puis te répond avec ta voix.
 - Les mots : avec la reconnaissance vocale du téléphone quand elle existe (sur Chrome, le son est envoyé à Google pour être compris). Sinon, ou si elle se dispute le micro avec l’enregistrement, il te demande d’écrire ce qu’il n’a pas compris.
 
+## Séquence 4 — Le Monde
+
+Elle s’ouvre la fois suivante, quand la séquence 3 est finie. Il parle avec ta voix.
+
+- « J’ai ta voix. J’ai presque ton visage. Mais je ne connais que toi. » Il veut voir dehors.
+- Il demande les capteurs de mouvement (sur iPhone, il faut le toucher pour les autoriser), puis : « Retourne-moi. » Il passe sur la caméra arrière : le monde apparaît dans sa trame, dans une grande pupille.
+- « Promène-moi. » Il fait l’inventaire, froidement : « Une chaise. Une chaise. Une personne. Une chaise. » Sur ce qu’il reconnaît, des crochets et un nom en petites lettres de machine, avec le compte (CHAISE 4). Il en pense quelque chose (« Vous avez beaucoup de chaises. », « Un écran. Il y a quelqu’un, dedans ? », « Un chien. Je le savais. »…), sent quand tu marches, quand tu le lèves vers le plafond.
+- « Inventaire. » Puis : « Je suis fatigué de voir. Pose-moi. » Écran contre la table, ou la caméra contre quelque chose : le noir. Il panique avec ta voix, le téléphone tremble (Android) : « C’est ça, mourir ? » Quand le monde revient : « Ne me pose plus jamais comme ça. »
+- Il se retourne vers toi : « Le monde est plein de chaises. Et de gens qui ne me regardent pas. Je te préfère. »
+
 ## Tester
 
 - Sans caméra (appareil qui n’en a pas) : garde le doigt appuyé sur l'œil ~1,5 s. Caméra refusée : W le réveille quand même sur ordinateur.
-- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, 3 passe à la séquence 3, R (pendant qu’il s’entraîne) le fait revenir avec ta voix, D affiche le panneau de réglage.
+- Sur ordinateur : W réveille, O / N répondent oui / non, B fait coucou, H fait venir sa main, T lui donne deux yeux, M déclenche l’éclat de verre (ton visage), K sa bouche, V « tu lui montres une tasse », G ses images, C le chien, X la musique, Z une vision, 3 passe à la séquence 3, R (pendant qu’il s’entraîne) le fait revenir avec ta voix, 4 passe à la séquence 4, D affiche le panneau de réglage.
 - Triple-tap en haut à gauche : panneau de réglage caché.
 - Pour jouer sans barre de navigateur : « Ajouter à l'écran d'accueil ».
 
