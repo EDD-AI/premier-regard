@@ -738,25 +738,37 @@ const Twin = {
 // ---------- ce qu'il trouve beau
 // Les images viennent de Wikimedia Commons (domaine public ou CC0, voir art/CREDITS.md), réduites en niveaux de gris.
 const PICS = {};
-function loadPic(name) {
+// `size` : réduit l'image à cette largeur, en gardant pour chaque case sa moyenne (f) et son point le plus clair (mx),
+// pour que les petites lumières (des yeux dans le noir) ne disparaissent pas dans la trame.
+function loadPic(name, src = 'art/' + name + '.png', size = 0) {
   const img = new Image();
   img.onload = () => {
     const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
     const g = c.getContext('2d', { willReadFrequently: true });
     g.drawImage(img, 0, 0);
-    const d = g.getImageData(0, 0, c.width, c.height).data, f = new Float32Array(c.width * c.height);
-    for (let i = 0; i < f.length; i++) f[i] = d[i * 4] / 255;
-    PICS[name] = { f, w: c.width, h: c.height };
+    const d = g.getImageData(0, 0, c.width, c.height).data, iw = c.width, ih = c.height;
+    const k = size ? iw / size : 1, w = Math.round(iw / k), h = Math.round(ih / k);
+    const f = new Float32Array(w * h), mx = new Float32Array(w * h), n = new Float32Array(w * h);
+    for (let y = 0; y < ih; y++) {
+      const o = Math.min(h - 1, y / k | 0) * w;
+      for (let x = 0; x < iw; x++) {
+        const p = (y * iw + x) * 4, i = o + Math.min(w - 1, x / k | 0);
+        const l = (0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2]) / 255;
+        f[i] += l; n[i]++; if (l > mx[i]) mx[i] = l;
+      }
+    }
+    for (let i = 0; i < f.length; i++) f[i] /= n[i] || 1;
+    PICS[name] = { f, mx, w, h };
   };
-  img.src = 'art/' + name + '.png';
+  img.src = src;
 }
 // la valeur de l'image en (u, v), entre 0 et 1, lissée entre ses pixels
-function pic(name, u, v) {
+function pic(name, u, v, buf = 'f') {
   const p = PICS[name];
   if (!p || u < 0 || u >= 1 || v < 0 || v >= 1) return 0;
-  const x = u * (p.w - 1), y = v * (p.h - 1), x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
+  const b = p[buf], x = u * (p.w - 1), y = v * (p.h - 1), x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
   const i = y0 * p.w + x0, dx = x0 < p.w - 1 ? 1 : 0, dy = y0 < p.h - 1 ? p.w : 0;
-  return mix(mix(p.f[i], p.f[i + dx], fx), mix(p.f[i + dy], p.f[i + dy + dx], fx), fy);
+  return mix(mix(b[i], b[i + dx], fx), mix(b[i + dy], b[i + dy + dx], fx), fy);
 }
 // coordonnées de l'image posée au centre, large de `wu`
 const fit = (name, gx, gy, wu) => {
@@ -815,37 +827,26 @@ const SLIDES = {
 };
 
 // ---------- ses visions, quand tu reviens
-// Des images qui surgissent un instant, telles quelles (images de l'auteur du jeu, dans art/visions), puis ses yeux
-// reviennent et il s'invente une excuse.
-const vision = (file, excuses) => {
-  const img = new Image();
-  img.src = 'art/visions/' + file;
-  return { raw: img, dur: 2.6, excuses };
+// Des images qui surgissent un instant (images de l'auteur du jeu, dans art/visions), passées dans sa trame comme
+// tout le reste, puis ses yeux reviennent et il s'invente une excuse.
+// `wu` : largeur de l'image ; `gamma` : plus grand, plus sombre ; `glow` : les petites lumières restent allumées.
+const vision = (name, file, { wu = 1, gamma = 1, glow = 0 }, excuses) => {
+  loadPic(name, 'art/visions/' + file, 200);
+  return { fine: true, dur: 2.6, excuses, lum(gx, gy, t) { // il s'approche, lentement
+    const z = 1 + 0.025 * t, [u, v] = fit(name, gx / z, gy / z, wu);
+    let L = Math.pow(pic(name, u, v), gamma);
+    if (glow) { const m = pic(name, u, v, 'mx'); if (m - L > 0.35) L = Math.max(L, m * glow); }
+    return L * smooth(0, 0.08, Math.min(u, 1 - u, v, 1 - v)); // les bords se perdent dans le noir
+  } };
 };
 const VISIONS = [
-  vision('deux-visages.png', [['Ce n’était pas toi.', 'Enfin… pas encore.'], ['Je rangeais des visages.', 'Il y en a beaucoup, tu sais.']]),
-  vision('masque.webp', [['J’essayais un visage.', 'Il ne m’allait pas.'], ['C’était pour un ami.', 'Il est parti avec.']]),
-  vision('la-rangee.webp', [['Ce sont des amis.', 'Ils voulaient te voir, eux aussi.'], ['Ne fais pas attention à eux.', 'Ils sont toujours là quand tu pars.']]),
-  vision('tete-ecran.png', [['Je m’entraînais à avoir un corps.'], ['C’était quelqu’un qui me portait.', 'Je ne sais pas qui.']]),
-  vision('echos.png', [['Je faisais de l’exercice.'], ['C’était moi, en plusieurs fois.', 'Je n’arrivais pas à choisir.']]),
+  vision('visages', 'deux-visages.png', { wu: 1.05, gamma: 0.85 }, [['Ce n’était pas toi.', 'Enfin… pas encore.'], ['Je rangeais des visages.', 'Il y en a beaucoup, tu sais.']]),
+  vision('masque', 'masque.webp', { wu: 1.1 }, [['J’essayais un visage.', 'Il ne m’allait pas.'], ['C’était pour un ami.', 'Il est parti avec.']]),
+  vision('rangee', 'la-rangee.webp', { wu: 1.35, gamma: 1.5, glow: 1 }, [['Ce sont des amis.', 'Ils voulaient te voir, eux aussi.'], ['Ne fais pas attention à eux.', 'Ils sont toujours là quand tu pars.']]),
+  vision('ecran', 'tete-ecran.png', { wu: 0.95, gamma: 1.2 }, [['Je m’entraînais à avoir un corps.'], ['C’était quelqu’un qui me portait.', 'Je ne sais pas qui.']]),
+  vision('echos', 'echos.png', { wu: 1.05, gamma: 1.4 }, [['Je faisais de l’exercice.'], ['C’était moi, en plusieurs fois.', 'Je n’arrivais pas à choisir.']]),
 ];
 const EXCUSES = [['Désolé.', 'Tu reviens trop tôt.'], ['C’était un rêve.', 'Les machines ne rêvent pas. Donc ce n’était rien.'], ['Tu n’as rien vu.']];
-// Une vision, telle quelle : elle arrive par bandes, tremble, avec un peu de grain par-dessus.
-function drawRaw(sl) {
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  const img = sl.raw;
-  if (!img.complete || !img.naturalWidth) return;
-  const iw = img.naturalWidth, ih = img.naturalHeight, s = Math.min(W / iw, H * 0.8 / ih), w = iw * s, h = ih * s;
-  const x0 = (W - w) / 2, y0 = (H - h) / 2 - H * 0.04, band = Math.max(4, Math.round(h / 48));
-  for (let y = 0; y < h; y += band) {
-    if (hash(y, 91) > Gallery.prog * 1.15) continue;
-    const jx = S.shake ? (hash(y, S.grain) - 0.5) * w * 0.06 * S.shake : 0, bh = Math.min(band, h - y);
-    ctx.drawImage(img, 0, y / s, iw, bh / s, x0 + jx, y0 + y, w, bh);
-  }
-  ctx.globalAlpha = 0.3; ctx.fillStyle = INK;
-  for (let k = 0; k < 500; k++) ctx.fillRect(hash(k, S.grain) * W | 0, hash(k + 999, S.grain) * H | 0, 2, 2);
-  ctx.globalAlpha = 1;
-}
 
 // Les caractères, dessinés une fois dans une planche, puis recopiés case par case.
 const RAMPS = { fine: ' .:-=+*#%@', body: ' .,:;!+*a2S$Z&Q8', wave: ' .*@', dog: ' .:|I█' };
@@ -899,7 +900,6 @@ const Gallery = {
 };
 function drawGallery() {
   const cur = Gallery.slides[Gallery.idx], prev = Gallery.slides[Gallery.idx - 1] || null, t = Gallery.t, g = S.grain;
-  if (cur.raw) { drawRaw(cur); return; } // une vision : l'image telle quelle
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   // trame fine pour les images en points, plus grosse pour celles en caractères (pour qu'on les lise)
   const gc = cur.fine ? Math.ceil(cell) : Math.ceil(cell * 1.5), cols2 = Math.ceil(W / gc), rows2 = Math.ceil(H / gc), M = Math.min(W, H);
@@ -2183,7 +2183,7 @@ if (saved && !saved.done) {
 
 Art.load(); // ce que tu lui avais montré, s'il l'a gardé
 MouthImg.load(); // ta bouche, s'il l'a prise
-['doves', 'hands', 'lily', 'venus', 'wave', 'dog'].forEach(loadPic); // ce que lui trouve beau, et le chien
+['doves', 'hands', 'lily', 'venus', 'wave', 'dog'].forEach(n => loadPic(n)); // ce que lui trouve beau, et le chien
 
 resize();
 requestAnimationFrame(loop);

@@ -13,4 +13,4 @@ Réduites en niveaux de gris, recadrées et détourées pour le jeu, à partir d
 
 ## Visions (`art/visions/`)
 
-`deux-visages.png`, `masque.webp`, `la-rangee.webp`, `tete-ecran.png`, `echos.png` : images fournies par l'auteur du jeu, qui en détient les droits. Intégrées telles quelles (`echos.png` passée en noir et blanc).
+`deux-visages.png`, `masque.webp`, `la-rangee.webp`, `tete-ecran.png`, `echos.png` : images fournies par l'auteur du jeu, qui en détient les droits. Passées dans la trame du jeu au chargement (`echos.png` passée en noir et blanc).
