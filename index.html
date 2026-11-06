@@ -3771,7 +3771,8 @@ const Hearts = {
     if (!this.mark || this.mark.length !== cols * rows) this.mark = new Uint8Array(cols * rows);
     this.mark.fill(0);
     // le compteur, en haut : un cœur, et le nombre
-    const s = fmtN(this.shown), sc = 2, w = (5 + 2 + s.length * 4) * sc, i0 = (cols - w) / 2 | 0, j0 = 4;
+    const s = fmtN(this.shown), sc = (7 + s.length * 4) * 2 <= cols - 4 ? 2 : 1; // en petit quand il devient trop long
+    const w = (5 + 2 + s.length * 4) * sc, i0 = (cols - w) / 2 | 0, j0 = 4;
     this.glyph(HEART5, 5, i0, j0, sc, 2);
     [...s].forEach((ch, n) => this.glyph(FONT35[ch] || FONT35[' '], 3, i0 + (7 + n * 4) * sc, j0, sc, 1));
     // les cœurs qui montent vers lui, ou qui tombent
